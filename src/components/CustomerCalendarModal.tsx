@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
-import { Calendar as CalendarIcon, Clock, AlertTriangle, X, ChevronLeft, ChevronRight, Check } from 'lucide-react';
-import { fetchBusinessDays, subscribeToBusinessDays } from '../lib/dbService';
+import React, { useState, useEffect, useCallback } from 'react';
+import { Calendar as CalendarIcon, Clock, AlertTriangle, X, ChevronLeft, ChevronRight, Check, RefreshCw } from 'lucide-react';
+import { fetchBusinessDaysStrict, getFriendlyFirebaseErrorMessage, isBusinessDayClosed } from '../lib/dbService';
 
 interface CustomerCalendarModalProps {
   isOpen: boolean;
@@ -11,40 +11,26 @@ export default function CustomerCalendarModal({ isOpen, onClose }: CustomerCalen
   const [businessDays, setBusinessDays] = useState<string[]>([]);
   const [currentMonth, setCurrentMonth] = useState<Date>(new Date());
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const loadData = useCallback(async (forceServer: boolean = false) => {
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const days = await fetchBusinessDaysStrict(forceServer);
+      setBusinessDays(days);
+    } catch (err) {
+      console.error('Failed to load business days:', err);
+      setLoadError(getFriendlyFirebaseErrorMessage(err, 'load'));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     if (!isOpen) return;
-    let isMounted = true;
-    setLoading(true);
-
-    const unsubscribe = subscribeToBusinessDays((days) => {
-      if (isMounted) {
-        setBusinessDays(days);
-        setLoading(false);
-      }
-    });
-
-    async function loadData() {
-      try {
-        const days = await fetchBusinessDays();
-        if (isMounted) {
-          setBusinessDays(days);
-        }
-      } catch (err) {
-        console.error('Failed to load business days:', err);
-      } finally {
-        if (isMounted) {
-          setLoading(false);
-        }
-      }
-    }
-    loadData();
-
-    return () => {
-      isMounted = false;
-      unsubscribe();
-    };
-  }, [isOpen]);
+    loadData(false);
+  }, [isOpen, loadData]);
 
   if (!isOpen) return null;
 
@@ -136,11 +122,11 @@ export default function CustomerCalendarModal({ isOpen, onClose }: CustomerCalen
             <AlertTriangle className="w-4 h-4 text-sleek-gold shrink-0 mt-0.5" />
             <div>
               <p className="font-semibold text-amber-950 text-xs whitespace-nowrap">
-                ご予約はお受取り希望日の<span className="font-black underline font-serif">3日前まで</span>
+                予約締切：<span className="font-black underline font-serif">12/18（金）まで</span>
               </p>
               <p className="text-[10px] sm:text-[11px] text-stone-600 leading-relaxed">
-                <span className="inline-block">仕込みと準備のため、受取日の3日前の23:59をもって</span>
-                <span className="inline-block">自動で予約受付を締め切らせていただきます。</span>
+                <span className="inline-block">仕込みと準備のため、2026年12月18日（金）23:59をもって</span>
+                <span className="inline-block">予約受付を締め切らせていただきます。</span>
               </p>
             </div>
           </div>
@@ -152,6 +138,24 @@ export default function CustomerCalendarModal({ isOpen, onClose }: CustomerCalen
             <div className="flex flex-col items-center justify-center py-12 space-y-3">
               <div className="w-8 h-8 border-3 border-sleek-gold border-t-transparent rounded-full animate-spin"></div>
               <p className="text-xs text-sleek-muted font-mono">営業スケジュールを読み込み中...</p>
+            </div>
+          ) : loadError ? (
+            <div role="alert" className="bg-red-50 border border-red-200 rounded-2xl p-5 text-center space-y-3 my-4">
+              <div className="w-10 h-10 bg-red-100 rounded-full flex items-center justify-center mx-auto">
+                <AlertTriangle className="w-5 h-5 text-red-600" />
+              </div>
+              <div className="space-y-1">
+                <p className="text-sm font-bold text-red-900">営業日カレンダーを読み込めませんでした</p>
+                <p className="text-xs text-red-700 leading-relaxed">{loadError}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => loadData(true)}
+                className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-xl text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer transition-all"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>再読み込み</span>
+              </button>
             </div>
           ) : (
             <div className="space-y-4">
@@ -210,10 +214,8 @@ export default function CustomerCalendarModal({ isOpen, onClose }: CustomerCalen
                   const isPast = formattedDate < todayStr;
                   const isToday = formattedDate === todayStr;
 
-                  // Calculate booking deadline
-                  const diffMs = new Date(formattedDate + "T00:00:00+09:00").getTime() - new Date(todayStr + "T00:00:00+09:00").getTime();
-                  const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
-                  const isClosed = isSelected && diffDays < 3;
+                  // Check whether booking deadline (12/18) or pickup date has passed
+                  const isClosed = isSelected && isBusinessDayClosed(formattedDate, todayStr);
 
                   return (
                     <div

@@ -1,9 +1,21 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Reservation, ReservationItem, Cake } from '../types';
 import { TIME_SLOTS } from '../data/cakes';
-import { createReservation, fetchBusinessDays, subscribeToBusinessDays, fetchCakes, SoldOutConflictError } from '../lib/dbService';
+import {
+  createReservation,
+  fetchBusinessDaysStrict,
+  fetchCakesStrict,
+  fetchSalesStopRules,
+  applySalesStopRulesInMemory,
+  getEffectiveStockForDate,
+  isCakeSoldOutForDate,
+  SoldOutConflictError,
+  getFriendlyFirebaseErrorMessage,
+  isBusinessDayClosed,
+  isReservationDeadlinePassed
+} from '../lib/dbService';
 import { motion, AnimatePresence } from 'motion/react';
-import { Calendar, Clock, User, Mail, Phone, MessageSquare, Trash2, ShoppingBag, Gift, ArrowRight, CheckCircle2, ChevronRight, Sparkles, Check, AlertCircle, FileText } from 'lucide-react';
+import { Calendar, Clock, User, Mail, Phone, MessageSquare, Trash2, ShoppingBag, Gift, ArrowRight, CheckCircle2, ChevronRight, Sparkles, Check, AlertCircle, FileText, RefreshCw } from 'lucide-react';
 import ReservationSuccessModal from './ReservationSuccessModal';
 
 const FALLBACK_CAKE_IMAGE = 'https://images.unsplash.com/photo-1565958011703-44f9829ba187?w=600&auto=format&fit=crop&q=80';
@@ -11,8 +23,10 @@ const FALLBACK_CAKE_IMAGE = 'https://images.unsplash.com/photo-1565958011703-44f
 interface ReservationFormProps {
   cart: { [cakeId: string]: number };
   cakes: Cake[];
+  selectedPickupDate?: string;
+  onSelectPickupDate?: (date: string) => void;
   onCakesUpdated?: (cakes: Cake[]) => void;
-  onUpdateCartQty: (cakeId: string, quantity: number) => void;
+  onUpdateCartQty: (cakeId: string, quantity: number) => boolean | void;
   onClearCart: () => void;
   onReservationSuccess: (bookingId: string, reservation?: Reservation) => void;
   onReturnToCatalog?: () => void;
@@ -24,6 +38,8 @@ interface ReservationFormProps {
 export default function ReservationForm({
   cart,
   cakes,
+  selectedPickupDate,
+  onSelectPickupDate,
   onCakesUpdated,
   onUpdateCartQty,
   onClearCart,
@@ -39,61 +55,65 @@ export default function ReservationForm({
   const [email, setEmail] = useState(userEmail || '');
   const [phone, setPhone] = useState('');
   
-  const [date, setDate] = useState<string>('');
+  const [date, setDate] = useState<string>(selectedPickupDate || '');
   const [businessDays, setBusinessDays] = useState<string[]>([]);
   const [isLoadingDays, setIsLoadingDays] = useState<boolean>(true);
+  const [daysLoadError, setDaysLoadError] = useState<string | null>(null);
+  const attemptReservationIdRef = useRef<string | null>(null);
 
   const todayJst = useMemo(() => new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Tokyo" })), []);
   const todayStr = useMemo(() => `${todayJst.getFullYear()}-${String(todayJst.getMonth() + 1).padStart(2, '0')}-${String(todayJst.getDate()).padStart(2, '0')}`, [todayJst]);
 
   const selectableDays = useMemo(() => {
     const sorted = [...businessDays].sort();
-    // Strictly allow only configured business days >= 3 days from today (JST)
-    return sorted.filter(d => {
-      const diffMs = new Date(d + "T00:00:00+09:00").getTime() - new Date(todayStr + "T00:00:00+09:00").getTime();
-      const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
-      return diffDays >= 3;
-    });
+    // Strictly allow only configured business days before 12/18（金） deadline and after today (JST)
+    return sorted.filter(d => !isBusinessDayClosed(d, todayStr));
   }, [businessDays, todayStr]);
 
-  // Store business days fetched from db and subscribe to real-time updates
-  useEffect(() => {
-    let isMounted = true;
-    const unsubscribe = subscribeToBusinessDays((days) => {
-      if (isMounted) {
-        setBusinessDays(days);
-        setIsLoadingDays(false);
-      }
-    });
-
-    async function loadBusinessDays() {
-      try {
-        const days = await fetchBusinessDays();
-        if (isMounted) {
-          setBusinessDays(days);
-        }
-      } finally {
-        if (isMounted) {
-          setIsLoadingDays(false);
-        }
-      }
+  const loadBusinessDays = useCallback(async (forceServer: boolean = false) => {
+    setIsLoadingDays(true);
+    setDaysLoadError(null);
+    try {
+      const days = await fetchBusinessDaysStrict(forceServer);
+      setBusinessDays(days);
+    } catch (err) {
+      console.error('Failed to load business days in form:', err);
+      setDaysLoadError(getFriendlyFirebaseErrorMessage(err, 'load'));
+    } finally {
+      setIsLoadingDays(false);
     }
-    loadBusinessDays();
-
-    return () => {
-      isMounted = false;
-      unsubscribe();
-    };
   }, []);
+
+  // Load business days once on mount (uses short cache, no unnecessary realtime listener)
+  useEffect(() => {
+    loadBusinessDays(false);
+  }, [loadBusinessDays]);
+
+  // Reset idempotency key if cart or date changes
+  useEffect(() => {
+    attemptReservationIdRef.current = null;
+  }, [cart, date]);
+
+  // Keep synced with selectedPickupDate from parent when available
+  useEffect(() => {
+    if (selectedPickupDate && selectedPickupDate !== date && selectableDays.includes(selectedPickupDate)) {
+      setDate(selectedPickupDate);
+    }
+  }, [selectedPickupDate, selectableDays]);
 
   // Ensure a valid selectable date is selected, or clear date if none available
   useEffect(() => {
     if (selectableDays.length > 0 && (!date || !selectableDays.includes(date))) {
-      setDate(selectableDays[0]);
+      const next = (selectedPickupDate && selectableDays.includes(selectedPickupDate))
+        ? selectedPickupDate
+        : selectableDays[0];
+      setDate(next);
+      onSelectPickupDate?.(next);
     } else if (selectableDays.length === 0 && date) {
       setDate('');
+      onSelectPickupDate?.('');
     }
-  }, [selectableDays, date]);
+  }, [selectableDays, date, selectedPickupDate, onSelectPickupDate]);
 
   const getFormatLabel = (dateStr: string) => {
     try {
@@ -117,7 +137,10 @@ export default function ReservationForm({
     message: string;
     soldOutIds: string[];
     soldOutNames: string[];
+    insufficientItems?: { cakeId: string; cakeName: string; remaining: number; ordered: number }[];
   } | null>(null);
+  const [cartLimitWarning, setCartLimitWarning] = useState<string | null>(null);
+  const cartWarningTimerRef = useRef<number | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [step, setStep] = useState<'cart' | 'form' | 'confirm' | 'success'>('cart');
   const [completedBookingId, setCompletedBookingId] = useState('');
@@ -130,6 +153,25 @@ export default function ReservationForm({
     setLatestCatalog(cakes);
   }, [cakes]);
 
+  useEffect(() => {
+    return () => {
+      if (cartWarningTimerRef.current) {
+        window.clearTimeout(cartWarningTimerRef.current);
+      }
+    };
+  }, []);
+
+  const showCartLimitWarning = (msg: string) => {
+    if (cartWarningTimerRef.current) {
+      window.clearTimeout(cartWarningTimerRef.current);
+    }
+    setCartLimitWarning(msg);
+    cartWarningTimerRef.current = window.setTimeout(() => {
+      setCartLimitWarning(null);
+      cartWarningTimerRef.current = null;
+    }, 4000);
+  };
+
   // Map cart identifiers to concrete structures (keep sold-out items visible so exclusive control can flag & block them)
   const cartItems: (ReservationItem & { isSoldOut: boolean })[] = Object.entries(cart)
     .map(([cakeId, qty]) => {
@@ -141,48 +183,86 @@ export default function ReservationForm({
         cakeName: cake.jpName,
         quantity: qty,
         price: cake.price,
-        isSoldOut: Boolean(cake.isSoldOut)
+        isSoldOut: isCakeSoldOutForDate(cake, date)
       };
     })
     .filter((item): item is ReservationItem & { isSoldOut: boolean } => item !== null);
 
-  const soldOutCartItems = cartItems.filter(item => item.isSoldOut);
+  const soldOutCartItems = cartItems.filter(item => {
+    const cake = latestCatalog.find(c => c.id === item.cakeId) || cakes.find(c => c.id === item.cakeId);
+    return item.isSoldOut || isCakeSoldOutForDate(cake, date);
+  });
+  const totalCartQty = cartItems.reduce((acc, curr) => acc + curr.quantity, 0);
   const totalPrice = cartItems.reduce((acc, curr) => acc + (curr.price * curr.quantity), 0);
 
-  // Shared helper to fetch latest inventory from Firestore and check for sold-out conflicts (排他制御)
-  const verifyLatestInventoryFromFirestore = async (): Promise<{
+  // Shared helper to fetch latest inventory from Firestore and check for sold-out / stock-shortage conflicts (排他制御)
+  const verifyLatestInventoryFromFirestore = async (
+    forceServer: boolean = false,
+    targetDateOverride?: string
+  ): Promise<{
     ok: boolean;
     freshCakes: Cake[];
     freshDays: string[];
   }> => {
-    const [freshCakes, freshDays] = await Promise.all([
-      fetchCakes(true),
-      fetchBusinessDays()
+    const targetDate = targetDateOverride !== undefined ? targetDateOverride : date;
+    const [rawFreshCakes, freshDays, freshRules] = await Promise.all([
+      fetchCakesStrict(forceServer),
+      fetchBusinessDaysStrict(forceServer),
+      fetchSalesStopRules(forceServer),
     ]);
+    const freshCakes = applySalesStopRulesInMemory(rawFreshCakes, freshRules);
     setLatestCatalog(freshCakes);
     setBusinessDays(freshDays);
+    setDaysLoadError(null);
     if (onCakesUpdated) {
       onCakesUpdated(freshCakes);
     }
 
     const soldOutIds: string[] = [];
     const soldOutNames: string[] = [];
+    const insufficientItems: { cakeId: string; cakeName: string; remaining: number; ordered: number }[] = [];
 
     for (const [cakeId, qty] of Object.entries(cart)) {
-      if ((qty as number) <= 0) continue;
+      const orderedQty = qty as number;
+      if (orderedQty <= 0) continue;
       const found = freshCakes.find(c => c.id === cakeId);
       const fallback = cakes.find(c => c.id === cakeId);
-      if (!found || found.isSoldOut) {
+      const effectiveStock = getEffectiveStockForDate(found, targetDate);
+
+      if (!found || isCakeSoldOutForDate(found, targetDate)) {
         soldOutIds.push(cakeId);
         soldOutNames.push(found?.jpName || fallback?.jpName || '選択されたケーキ');
+      } else if (typeof effectiveStock === 'number' && orderedQty > effectiveStock) {
+        insufficientItems.push({
+          cakeId,
+          cakeName: found.jpName,
+          remaining: effectiveStock,
+          ordered: orderedQty,
+        });
       }
     }
 
-    if (soldOutIds.length > 0) {
+    if (soldOutIds.length > 0 || insufficientItems.length > 0) {
+      const parts: string[] = [];
+      if (soldOutNames.length > 0) {
+        parts.push(`「${soldOutNames.join('」「')}」は選択中のお受取り日において売り切れ（オーダーストップ）となっているためご予約を確定できません。`);
+      }
+      if (insufficientItems.length > 0) {
+        parts.push(
+          insufficientItems
+            .map(i =>
+              i.remaining <= 10
+                ? `「${i.cakeName}」は残りわずかのため、ご希望数（${i.ordered}個）をご用意できません。数量を減らして再度お試しください。`
+                : `「${i.cakeName}」はご希望数（${i.ordered}個）に対して在庫が不足しております（ご注文可能数：${i.remaining}個まで）。`
+            )
+            .join(' ')
+        );
+      }
       setStockError({
-        message: `申し訳ございません。ご注文いただいた「${soldOutNames.join('」「')}」が現在売り切れ（オーダーストップ）となっているため、ご予約を確定できません。カートから該当商品を削除して再度お手続きください。`,
+        message: `申し訳ございません。${parts.join(' ')}`,
         soldOutIds,
-        soldOutNames
+        soldOutNames,
+        insufficientItems,
       });
       window.scrollTo({ top: 0, behavior: 'smooth' });
       return { ok: false, freshCakes, freshDays };
@@ -243,9 +323,13 @@ export default function ReservationForm({
     setSubmitError(null);
     setIsVerifyingStock(true);
     try {
-      const { ok } = await verifyLatestInventoryFromFirestore();
+      const { ok } = await verifyLatestInventoryFromFirestore(true);
       if (!ok) return;
       setStep('form');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (err) {
+      console.error('Failed verifying inventory before form:', err);
+      setSubmitError(getFriendlyFirebaseErrorMessage(err, 'load'));
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } finally {
       setIsVerifyingStock(false);
@@ -262,12 +346,8 @@ export default function ReservationForm({
       const { ok, freshDays } = await verifyLatestInventoryFromFirestore();
       if (!ok) return;
 
-      // Check if selected date is a valid selectable business day (>= 3 days ahead)
-      const validLatestDays = [...freshDays].sort().filter((d) => {
-        const diffMs = new Date(d + "T00:00:00+09:00").getTime() - new Date(todayStr + "T00:00:00+09:00").getTime();
-        const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
-        return diffDays >= 3;
-      });
+      // Check if selected date is a valid selectable business day (deadline: 12/18)
+      const validLatestDays = [...freshDays].sort().filter((d) => !isBusinessDayClosed(d, todayStr));
       if (!date || !validLatestDays.includes(date)) {
         setErrors((prev) => ({
           ...prev,
@@ -279,6 +359,9 @@ export default function ReservationForm({
       }
     } catch (err) {
       console.warn('Pre-confirm verification notice:', err);
+      setSubmitError(getFriendlyFirebaseErrorMessage(err, 'load'));
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
     } finally {
       setIsVerifyingStock(false);
     }
@@ -294,17 +377,13 @@ export default function ReservationForm({
     setIsSubmitting(true);
     setSubmitError(null);
     try {
-      // 1. Re-fetch latest inventory & business days from Firestore before reservation submission (排他制御)
-      const { ok, freshCakes, freshDays } = await verifyLatestInventoryFromFirestore();
+      // 1. Verify business days & stock before executing atomic Firestore transaction (排他制御)
+      const { ok, freshCakes, freshDays } = await verifyLatestInventoryFromFirestore(false);
       if (!ok) {
         return;
       }
 
-      const validLatestDays = [...freshDays].sort().filter((d) => {
-        const diffMs = new Date(d + "T00:00:00+09:00").getTime() - new Date(todayStr + "T00:00:00+09:00").getTime();
-        const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
-        return diffDays >= 3;
-      });
+      const validLatestDays = [...freshDays].sort().filter((d) => !isBusinessDayClosed(d, todayStr));
       if (!date || !validLatestDays.includes(date)) {
         setSubmitError('選択されたお受取り日は現在ご予約可能な営業日ではありません。お受取り日を再選択してください。');
         setStep('form');
@@ -344,8 +423,14 @@ export default function ReservationForm({
         ...(notes.trim() ? { notes: notes.trim() } : {})
       };
 
+      // Reuse the same idempotency ID for retries on the same checkout attempt (二重予約防止)
+      if (!attemptReservationIdRef.current) {
+        attemptReservationIdRef.current = 'res_' + Math.random().toString(36).substr(2, 9);
+      }
+
       // 2. Execute atomic Firestore transaction inside createReservation (排他制御)
-      const completed = await createReservation(reservationData);
+      const completed = await createReservation(reservationData, attemptReservationIdRef.current);
+      attemptReservationIdRef.current = null;
       setCompletedReservation(completed);
       setCompletedBookingId(completed.id);
       setShowSuccessModal(true);
@@ -353,6 +438,13 @@ export default function ReservationForm({
       setSubmitError(null);
       setStep('success');
       onClearCart();
+      // Sync updated remaining stock / auto-sold-out state immediately to catalog
+      fetchCakesStrict(false)
+        .then((latest) => {
+          setLatestCatalog(latest);
+          if (onCakesUpdated) onCakesUpdated(latest);
+        })
+        .catch(() => {});
       onReservationSuccess(completed.id, completed);
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err: any) {
@@ -362,20 +454,24 @@ export default function ReservationForm({
           ? err.soldOutCakeNames
           : ['選択されたケーキ'];
         const ids: string[] = Array.isArray(err.soldOutCakeIds) ? err.soldOutCakeIds : [];
-        // Refresh catalog state so UI reflects the sold-out status immediately
-        fetchCakes(true).then((latest) => {
+        // Refresh catalog state so UI reflects updated stock / sold-out status immediately
+        fetchCakesStrict(true).then((latest) => {
           setLatestCatalog(latest);
           if (onCakesUpdated) onCakesUpdated(latest);
         }).catch(() => {});
+        const rawErrMsg = typeof err?.message === 'string' && err.message.trim() ? err.message.trim() : '';
+        const friendlyStockMsg = rawErrMsg
+          ? (rawErrMsg.includes('予約は完了していません') ? rawErrMsg : `予約は完了していません。${rawErrMsg}`)
+          : `予約は完了していません。申し訳ございませんが、ご注文いただいた「${names.join('」「')}」が直前に売り切れ（オーダーストップ）となったためご予約を確定できませんでした。カートから該当商品を削除して再度お手続きください。`;
         setStockError({
-          message: `申し訳ございません。ご注文いただいた「${names.join('」「')}」が直前に売り切れ（オーダーストップ）となったため、ご予約を確定できませんでした。カートから該当商品を削除して再度お手続きください。`,
+          message: friendlyStockMsg,
           soldOutIds: ids,
           soldOutNames: names
         });
         window.scrollTo({ top: 0, behavior: 'smooth' });
         return;
       }
-      setSubmitError('予約の送信に失敗しました。通信環境や入力内容をご確認の上、再試行してください。');
+      setSubmitError(getFriendlyFirebaseErrorMessage(err, 'write'));
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } finally {
       setIsSubmitting(false);
@@ -413,7 +509,9 @@ export default function ReservationForm({
             </div>
             <div className="space-y-1 flex-grow min-w-0">
               <h4 className="text-red-900 font-bold text-sm sm:text-base">
-                在庫切れ（オーダーストップ）のため予約を確定できません
+                {(stockError?.soldOutIds?.length || soldOutCartItems.length) > 0
+                  ? '在庫切れ（オーダーストップ）のため予約を確定できません'
+                  : 'この内容では予約を確定できません'}
               </h4>
               <p className="text-red-800 text-xs sm:text-sm leading-relaxed">
                 {stockError?.message ||
@@ -422,22 +520,40 @@ export default function ReservationForm({
             </div>
           </div>
           <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
-            <button
-              type="button"
-              onClick={() => {
-                const targetIds = stockError?.soldOutIds?.length
-                  ? stockError.soldOutIds
-                  : soldOutCartItems.map(i => i.cakeId);
-                targetIds.forEach(id => onUpdateCartQty(id, 0));
-                setStockError(null);
-                if (cartItems.length <= targetIds.length) {
+            {stockError?.insufficientItems && stockError.insufficientItems.length > 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  stockError.insufficientItems?.forEach((item) => {
+                    onUpdateCartQty(item.cakeId, item.remaining);
+                  });
+                  (stockError.soldOutIds || []).forEach((id) => onUpdateCartQty(id, 0));
+                  setStockError(null);
                   setStep('cart');
-                }
-              }}
-              className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white font-bold text-xs rounded-xl transition-all shadow-xs cursor-pointer"
-            >
-              売切商品をカートから削除する
-            </button>
+                }}
+                className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs rounded-xl transition-all shadow-xs cursor-pointer"
+              >
+                在庫数に合わせてカートを更新する
+              </button>
+            )}
+            {(stockError?.soldOutIds?.length || soldOutCartItems.length > 0) && (
+              <button
+                type="button"
+                onClick={() => {
+                  const targetIds = stockError?.soldOutIds?.length
+                    ? stockError.soldOutIds
+                    : soldOutCartItems.map(i => i.cakeId);
+                  targetIds.forEach(id => onUpdateCartQty(id, 0));
+                  setStockError(null);
+                  if (cartItems.length <= targetIds.length) {
+                    setStep('cart');
+                  }
+                }}
+                className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white font-bold text-xs rounded-xl transition-all shadow-xs cursor-pointer"
+              >
+                売切商品をカートから削除する
+              </button>
+            )}
             {onReturnToCatalog && (
               <button
                 type="button"
@@ -462,16 +578,28 @@ export default function ReservationForm({
       {submitError && step !== 'success' && (
         <div
           role="alert"
-          className="bg-amber-50 border border-amber-300 rounded-2xl p-4 text-amber-950 text-xs sm:text-sm flex items-center justify-between gap-3 shadow-xs"
+          className={`rounded-2xl p-4 sm:p-5 text-xs sm:text-sm flex items-start sm:items-center justify-between gap-3 shadow-sm ${
+            submitError.includes('予約は完了していません')
+              ? 'bg-red-50 border-2 border-red-400 text-red-950'
+              : 'bg-amber-50 border border-amber-300 text-amber-950'
+          }`}
         >
-          <div className="flex items-center gap-2.5">
-            <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
-            <span className="font-semibold">{submitError}</span>
+          <div className="flex items-start gap-2.5">
+            <AlertCircle
+              className={`w-5 h-5 shrink-0 mt-0.5 ${
+                submitError.includes('予約は完了していません') ? 'text-red-600' : 'text-amber-600'
+              }`}
+            />
+            <span className="font-bold leading-relaxed">{submitError}</span>
           </div>
           <button
             type="button"
             onClick={() => setSubmitError(null)}
-            className="text-amber-800 hover:text-amber-950 text-xs font-bold underline shrink-0"
+            className={`text-xs font-bold underline shrink-0 ${
+              submitError.includes('予約は完了していません')
+                ? 'text-red-800 hover:text-red-950'
+                : 'text-amber-800 hover:text-amber-950'
+            }`}
           >
             閉じる
           </button>
@@ -496,8 +624,21 @@ export default function ReservationForm({
         <ChevronRight className="w-3 h-3 text-sleek-muted shrink-0" />
         <button
           id="tab-step-form"
-          disabled={step === 'success' || cartItems.length === 0}
-          onClick={() => setStep('form')}
+          disabled={
+            step === 'success' ||
+            cartItems.length === 0 ||
+            isVerifyingStock ||
+            soldOutCartItems.length > 0 ||
+            (!isLoadingDays && (selectableDays.length === 0 || Boolean(daysLoadError)))
+          }
+          onClick={() => {
+            if (step === 'cart') {
+              handleProceedToForm();
+            } else {
+              setStep('form');
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            }
+          }}
           className={`font-semibold flex items-center gap-1 px-2 sm:px-4 py-1 sm:py-2 rounded-full transition-colors whitespace-nowrap shrink-0 ${
             step === 'form'
               ? 'text-sleek-gold bg-sleek-cream border border-sleek-border/60 shadow-xs'
@@ -510,9 +651,35 @@ export default function ReservationForm({
         <ChevronRight className="w-3 h-3 text-sleek-muted shrink-0" />
         <button
           id="tab-step-confirm"
-          disabled={step === 'success' || cartItems.length === 0 || !name.trim() || !email.trim() || !phone.trim()}
-          onClick={() => {
-            if (validate()) setStep('confirm');
+          disabled={step === 'success' || cartItems.length === 0 || isVerifyingStock || !name.trim() || !email.trim() || !phone.trim()}
+          onClick={async () => {
+            setSubmitError(null);
+            if (!validate()) return;
+            setIsVerifyingStock(true);
+            try {
+              const { ok, freshDays } = await verifyLatestInventoryFromFirestore(false);
+              if (!ok) return;
+              const validLatestDays = [...freshDays].sort().filter((d) => !isBusinessDayClosed(d, todayStr));
+              if (!date || !validLatestDays.includes(date)) {
+                setErrors((prev) => ({
+                  ...prev,
+                  date: '選択された日程は現在ご予約可能な営業日ではありません。営業日をご確認の上、再度ご選択ください。'
+                }));
+                setSubmitError('選択されたお受取り日は現在ご予約可能な営業日ではありません。お受取り日を再選択してください。');
+                setStep('form');
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+                return;
+              }
+              setNameKana(prev => toKatakana(prev.trim()));
+              setPhone(prev => normalizePhone(prev));
+              setStep('confirm');
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            } catch (err) {
+              setSubmitError(getFriendlyFirebaseErrorMessage(err, 'load'));
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            } finally {
+              setIsVerifyingStock(false);
+            }
           }}
           className={`font-semibold flex items-center gap-1 px-2 sm:px-4 py-1 sm:py-2 rounded-full transition-colors whitespace-nowrap shrink-0 ${
             step === 'confirm'
@@ -548,13 +715,36 @@ export default function ReservationForm({
               <div className="bg-white rounded-2xl sm:rounded-3xl p-4 sm:p-6 border border-sleek-border shadow-xs space-y-4">
                 <h3 className="font-light text-base sm:text-lg text-sleek-dark font-serif border-b border-sleek-border pb-3 flex items-center justify-between">
                   <span>カート内商品</span>
-                  <span className="text-xs font-sans text-sleek-muted font-normal">合計 {cartItems.length} 種類</span>
+                  <span className="text-xs font-sans text-sleek-muted font-normal">
+                    合計 {totalCartQty} / 10個（{cartItems.length}種類）
+                  </span>
                 </h3>
+
+                {cartLimitWarning && (
+                  <div
+                    role="alert"
+                    className="bg-red-50 border border-red-300 text-red-800 px-3.5 py-2.5 rounded-xl text-xs font-bold flex items-center justify-between gap-2 animate-fade-in"
+                  >
+                    <div className="flex items-center gap-2">
+                      <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+                      <span>{cartLimitWarning}</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setCartLimitWarning(null)}
+                      className="text-[11px] text-red-700 hover:underline shrink-0"
+                    >
+                      閉じる
+                    </button>
+                  </div>
+                )}
                 
                 <div className="divide-y divide-sleek-border">
                   {cartItems.map((item) => {
                     const cake = latestCatalog.find(c => c.id === item.cakeId) || cakes.find(c => c.id === item.cakeId);
-                    const isItemSoldOut = Boolean(item.isSoldOut || cake?.isSoldOut);
+                    const effectiveStock = getEffectiveStockForDate(cake, date);
+                    const isItemSoldOut = Boolean(item.isSoldOut || isCakeSoldOutForDate(cake, date));
+                    const isLowStock = !isItemSoldOut && typeof effectiveStock === 'number' && effectiveStock > 0 && effectiveStock <= 10;
                     return (
                       <div
                         key={item.cakeId}
@@ -588,6 +778,11 @@ export default function ReservationForm({
                                 売切・予約不可
                               </span>
                             )}
+                            {isLowStock && (
+                              <span className="px-1.5 py-0.5 bg-amber-50 text-amber-800 border border-amber-300 text-[10px] font-bold rounded-md shrink-0">
+                                残りわずかです！
+                              </span>
+                            )}
                           </div>
                           <p className="text-sleek-gold font-light text-xs font-mono mt-0.5">
                             ¥{item.price.toLocaleString()}
@@ -599,7 +794,10 @@ export default function ReservationForm({
                           <div className="flex items-center border border-sleek-border rounded-xl bg-sleek-bg overflow-hidden h-8 sm:h-9">
                             <button
                               id={`cart-qty-minus-${item.cakeId}`}
-                              onClick={() => onUpdateCartQty(item.cakeId, item.quantity - 1)}
+                              onClick={() => {
+                                setCartLimitWarning(null);
+                                onUpdateCartQty(item.cakeId, item.quantity - 1);
+                              }}
                               className="px-2 sm:px-2.5 text-sleek-muted hover:bg-sleek-cream hover:text-sleek-dark h-full transition-colors font-bold text-xs"
                               aria-label="数量を減らす"
                             >
@@ -610,7 +808,33 @@ export default function ReservationForm({
                             </span>
                             <button
                               id={`cart-qty-plus-${item.cakeId}`}
-                              onClick={() => onUpdateCartQty(item.cakeId, item.quantity + 1)}
+                              onClick={() => {
+                                if (totalCartQty >= 10) {
+                                  onUpdateCartQty(item.cakeId, item.quantity + 1);
+                                  showCartLimitWarning('1回のご予約で10個までです！');
+                                  return;
+                                }
+                                if (cake?.category === 'hall' && item.quantity + 1 > 2) {
+                                  onUpdateCartQty(item.cakeId, item.quantity + 1);
+                                  showCartLimitWarning(`ホールケーキ（${item.cakeName}）は各種2台までとなっております。`);
+                                  return;
+                                }
+                                if (typeof effectiveStock === 'number' && item.quantity + 1 > effectiveStock) {
+                                  onUpdateCartQty(item.cakeId, item.quantity + 1);
+                                  showCartLimitWarning(
+                                    effectiveStock <= 10
+                                      ? `「${item.cakeName}」は残りわずかのため、これ以上追加できません。`
+                                      : `「${item.cakeName}」の在庫上限（${effectiveStock}個）までとなっております。`
+                                  );
+                                  return;
+                                }
+                                const updated = onUpdateCartQty(item.cakeId, item.quantity + 1);
+                                if (updated === false) {
+                                  showCartLimitWarning('1回のご予約で10個までです！');
+                                } else {
+                                  setCartLimitWarning(null);
+                                }
+                              }}
                               className="px-2 sm:px-2.5 text-sleek-muted hover:bg-sleek-cream hover:text-sleek-dark h-full transition-colors font-bold text-xs"
                               aria-label="数量を増やす"
                             >
@@ -620,7 +844,10 @@ export default function ReservationForm({
                           
                           <button
                             id={`cart-item-delete-${item.cakeId}`}
-                            onClick={() => onUpdateCartQty(item.cakeId, 0)}
+                            onClick={() => {
+                              setCartLimitWarning(null);
+                              onUpdateCartQty(item.cakeId, 0);
+                            }}
                             className="text-sleek-muted hover:text-red-500 p-1.5 transition-colors"
                             title="商品を削除"
                           >
@@ -636,7 +863,55 @@ export default function ReservationForm({
 
             {/* Cart Right column: Summary */}
             <div className="space-y-4">
-              <div className="bg-sleek-cream rounded-2xl sm:rounded-3xl p-5 sm:p-6 border border-[#F2EDE4] shadow-xs space-y-5 sm:space-y-6">
+              <div className="bg-sleek-cream rounded-2xl sm:rounded-3xl p-5 sm:p-6 border border-[#F2EDE4] shadow-xs space-y-4 sm:space-y-5">
+                {daysLoadError ? (
+                  <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-center space-y-2">
+                    <p className="text-[11px] font-bold text-red-800 leading-relaxed">{daysLoadError}</p>
+                    <button
+                      type="button"
+                      onClick={() => loadBusinessDays(true)}
+                      disabled={isLoadingDays}
+                      className="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${isLoadingDays ? 'animate-spin' : ''}`} />
+                      <span>営業日を再読み込み</span>
+                    </button>
+                  </div>
+                ) : selectableDays.length > 0 ? (
+                  <div className="space-y-1.5 bg-white p-3 rounded-xl border border-sleek-border-light">
+                    <label
+                      htmlFor="cart-pickup-date-select"
+                      className="text-[11px] font-bold text-sleek-dark flex items-center gap-1.5"
+                    >
+                      <Calendar className="w-3.5 h-3.5 text-sleek-gold shrink-0" />
+                      <span>お受取り希望日（予約可能日）</span>
+                    </label>
+                    <select
+                      id="cart-pickup-date-select"
+                      value={date}
+                      onChange={(e) => {
+                        const nextDate = e.target.value;
+                        setDate(nextDate);
+                        onSelectPickupDate?.(nextDate);
+                        setStockError(null);
+                      }}
+                      className="w-full border border-sleek-border px-2.5 py-2 rounded-lg text-xs font-medium text-sleek-dark bg-white focus:outline-none focus:ring-1 focus:ring-sleek-gold cursor-pointer"
+                    >
+                      {selectableDays.map((dStr) => (
+                        <option key={dStr} value={dStr}>
+                          {getFormatLabel(dStr)}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ) : !isLoadingDays ? (
+                  <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-[11px] text-amber-900 font-medium leading-relaxed">
+                    {isReservationDeadlinePassed(todayStr)
+                      ? 'ご予約受付は12/18（金）をもって終了いたしました。'
+                      : '現在ご予約可能なお受取り日が設定されていないため、お手続きを進められません。'}
+                  </div>
+                ) : null}
+
                 <div className="flex justify-between items-baseline py-1 border-b border-sleek-border/30 pb-3">
                   <span className="font-semibold text-xs tracking-wider uppercase text-sleek-dark">お支払い合計</span>
                   <div className="text-right">
@@ -649,11 +924,23 @@ export default function ReservationForm({
 
                 <button
                   id="btn-go-to-form"
-                  disabled={isVerifyingStock || soldOutCartItems.length > 0}
+                  disabled={
+                    isVerifyingStock ||
+                    soldOutCartItems.length > 0 ||
+                    isLoadingDays ||
+                    Boolean(daysLoadError) ||
+                    selectableDays.length === 0
+                  }
                   onClick={handleProceedToForm}
                   className="w-full bg-sleek-dark hover:bg-black disabled:bg-stone-300 disabled:cursor-not-allowed text-white font-semibold text-xs py-3.5 rounded-xl uppercase tracking-widest transition-all shadow-md flex items-center justify-center gap-1.5 border border-sleek-border-light active:scale-95"
                 >
-                  <span>{isVerifyingStock ? '在庫状況を確認中...' : 'ご予約者情報の入力へ'}</span>
+                  <span>
+                    {isLoadingDays
+                      ? '営業日を確認中...'
+                      : isVerifyingStock
+                      ? '在庫状況を確認中...'
+                      : 'ご予約者情報の入力へ'}
+                  </span>
                   <ArrowRight className="w-4 h-4 text-sleek-gold" />
                 </button>
               </div>
@@ -684,7 +971,7 @@ export default function ReservationForm({
                     }}
                     placeholder="山田 太郎"
                     className={`w-full border px-4 py-3 rounded-xl text-sleek-dark placeholder-sleek-muted text-base sm:text-sm focus:outline-none focus:ring-1 focus:ring-sleek-gold bg-white ${
-                      errors.name ? 'border-red-400 focus:ring-red-450' : 'border-sleek-border'
+                      errors.name ? 'border-red-400 focus:ring-red-400' : 'border-sleek-border'
                     }`}
                   />
                   {errors.name && <p className="text-red-500 text-[10px] font-semibold">{errors.name}</p>}
@@ -706,7 +993,7 @@ export default function ReservationForm({
                     }}
                     placeholder="ヤマダ タロウ"
                     className={`w-full border px-4 py-3 rounded-xl text-sleek-dark placeholder-sleek-muted text-base sm:text-sm focus:outline-none focus:ring-1 focus:ring-sleek-gold bg-white ${
-                      errors.nameKana ? 'border-red-400 focus:ring-red-450' : 'border-sleek-border'
+                      errors.nameKana ? 'border-red-400 focus:ring-red-400' : 'border-sleek-border'
                     }`}
                   />
                   {errors.nameKana && <p className="text-red-500 text-[10px] font-semibold">{errors.nameKana}</p>}
@@ -728,7 +1015,7 @@ export default function ReservationForm({
                     }}
                     placeholder="your@email.com"
                     className={`w-full border px-4 py-3 rounded-xl text-sleek-dark placeholder-sleek-muted text-base sm:text-sm focus:outline-none focus:ring-1 focus:ring-sleek-gold bg-white ${
-                      errors.email ? 'border-red-400 focus:ring-red-450' : 'border-sleek-border'
+                      errors.email ? 'border-red-400 focus:ring-red-400' : 'border-sleek-border'
                     }`}
                   />
                   {errors.email && <p className="text-red-500 text-[10px] font-semibold">{errors.email}</p>}
@@ -750,10 +1037,13 @@ export default function ReservationForm({
                     }}
                     placeholder="090-1234-5678"
                     className={`w-full border px-4 py-3 rounded-xl text-sleek-dark placeholder-sleek-muted text-base sm:text-sm focus:outline-none focus:ring-1 focus:ring-sleek-gold bg-white ${
-                      errors.phone ? 'border-red-400 focus:ring-red-450' : 'border-sleek-border'
+                      errors.phone ? 'border-red-400 focus:ring-red-400' : 'border-sleek-border'
                     }`}
                   />
                   {errors.phone && <p className="text-red-500 text-[10px] font-semibold">{errors.phone}</p>}
+                  <p className="text-[10px] text-sleek-muted">
+                    ※ご予約内容について、事前に確認の連絡を入れる場合がございます。
+                  </p>
                 </div>
 
                 {/* Date Selection */}
@@ -764,47 +1054,67 @@ export default function ReservationForm({
                   </label>
                   
                   <div className="relative pt-1.5">
-                    <select
-                      id="pickup-date-select"
-                      value={date}
-                      onChange={(e) => {
-                        setDate(e.target.value);
-                        if (errors.date) setErrors(prev => ({ ...prev, date: '' }));
-                      }}
-                      className="w-full border border-sleek-border px-3 sm:px-4 py-3 rounded-xl text-sleek-dark text-sm sm:text-base focus:outline-none focus:ring-1 focus:ring-sleek-gold bg-white cursor-pointer hover:border-sleek-gold transition-colors font-medium text-center"
-                    >
-                      {isLoadingDays ? (
-                        <option value="">営業日カレンダーを読み込み中...</option>
-                      ) : selectableDays.length === 0 ? (
-                        <option value="">現在受取り可能日（営業日）として設定されている日程がありません</option>
-                      ) : (
-                        <>
-                          <option value="">-- 日付をご選択ください --</option>
-                          {selectableDays.map((dStr) => (
-                            <option key={dStr} value={dStr}>
-                              {getFormatLabel(dStr)}
-                            </option>
-                          ))}
-                        </>
-                      )}
-                    </select>
+                    {daysLoadError ? (
+                      <div role="alert" className="bg-red-50 border border-red-200 rounded-xl p-3.5 text-center space-y-2.5">
+                        <p className="text-xs font-bold text-red-800 leading-relaxed">{daysLoadError}</p>
+                        <button
+                          type="button"
+                          onClick={() => loadBusinessDays(true)}
+                          disabled={isLoadingDays}
+                          className="px-3.5 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                        >
+                          <RefreshCw className={`w-3.5 h-3.5 ${isLoadingDays ? 'animate-spin' : ''}`} />
+                          <span>再読み込み</span>
+                        </button>
+                      </div>
+                    ) : (
+                      <select
+                        id="pickup-date-select"
+                        value={date}
+                        onChange={(e) => {
+                          const nextDate = e.target.value;
+                          setDate(nextDate);
+                          onSelectPickupDate?.(nextDate);
+                          setStockError(null);
+                          if (errors.date) setErrors(prev => ({ ...prev, date: '' }));
+                        }}
+                        className="w-full border border-sleek-border px-3 sm:px-4 py-3 rounded-xl text-sleek-dark text-sm sm:text-base focus:outline-none focus:ring-1 focus:ring-sleek-gold bg-white cursor-pointer hover:border-sleek-gold transition-colors font-medium text-center"
+                      >
+                        {isLoadingDays ? (
+                          <option value="">営業日カレンダーを読み込み中...</option>
+                        ) : selectableDays.length === 0 ? (
+                          <option value="">現在受取り可能日（営業日）として設定されている日程がありません</option>
+                        ) : (
+                          <>
+                            <option value="">-- 日付をご選択ください --</option>
+                            {selectableDays.map((dStr) => (
+                              <option key={dStr} value={dStr}>
+                                {getFormatLabel(dStr)}
+                              </option>
+                            ))}
+                          </>
+                        )}
+                      </select>
+                    )}
                   </div>
 
                   {/* Feedback text below dropdown */}
-                  {date ? (
-                    <div className="bg-white border border-sleek-border-light shadow-xs p-2.5 sm:p-3 rounded-xl mt-2 flex flex-wrap items-center justify-center gap-1 sm:gap-1.5 animate-fade-in text-center">
-                      <Check className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-emerald-600 shrink-0 font-bold" />
-                      <span className="text-[11px] sm:text-xs text-sleek-dark font-medium whitespace-nowrap">
-                        ご予約お受取り確定日：
-                      </span>
-                      <strong className="text-[11px] sm:text-xs text-sleek-gold font-sans font-bold whitespace-nowrap">
-                        {getFormatLabel(date)}
-                      </strong>
-                    </div>
-                  ) : (
-                    <div className="bg-red-50/40 p-2.5 rounded-xl border border-red-100 text-center text-[10px] text-red-600 font-medium">
-                      ⚠️ お受取り可能な店舗営業日が上記に表示されます。選択してください。
-                    </div>
+                  {!daysLoadError && (
+                    date ? (
+                      <div className="bg-white border border-sleek-border-light shadow-xs p-2.5 sm:p-3 rounded-xl mt-2 flex flex-wrap items-center justify-center gap-1 sm:gap-1.5 animate-fade-in text-center">
+                        <Check className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-emerald-600 shrink-0 font-bold" />
+                        <span className="text-[11px] sm:text-xs text-sleek-dark font-medium whitespace-nowrap">
+                          ご予約お受取り確定日：
+                        </span>
+                        <strong className="text-[11px] sm:text-xs text-sleek-gold font-sans font-bold whitespace-nowrap">
+                          {getFormatLabel(date)}
+                        </strong>
+                      </div>
+                    ) : (
+                      <div className="bg-red-50/40 p-2.5 rounded-xl border border-red-100 text-center text-[10px] text-red-600 font-medium">
+                        ⚠️ お受取り可能な店舗営業日が上記に表示されます。選択してください。
+                      </div>
+                    )
                   )}
                   {errors.date && <p className="text-red-500 text-[10px] font-semibold text-center mt-1">{errors.date}</p>}
                 </div>
@@ -880,7 +1190,9 @@ export default function ReservationForm({
                 <div className="divide-y divide-sleek-border">
                   {cartItems.map((item) => {
                     const cake = latestCatalog.find(c => c.id === item.cakeId) || cakes.find(c => c.id === item.cakeId);
-                    const isItemSoldOut = Boolean(item.isSoldOut || cake?.isSoldOut);
+                    const effectiveStock = getEffectiveStockForDate(cake, date);
+                    const isItemSoldOut = Boolean(item.isSoldOut || isCakeSoldOutForDate(cake, date));
+                    const isLowStock = !isItemSoldOut && typeof effectiveStock === 'number' && effectiveStock > 0 && effectiveStock <= 10;
                     return (
                       <div
                         key={item.cakeId}
@@ -912,6 +1224,11 @@ export default function ReservationForm({
                             {isItemSoldOut && (
                               <span className="px-1.5 py-0.5 bg-red-600 text-white text-[9px] font-bold rounded-full shrink-0">
                                 売切・予約不可
+                              </span>
+                            )}
+                            {isLowStock && (
+                              <span className="px-1.5 py-0.5 bg-amber-50 text-amber-800 border border-amber-300 text-[9px] font-bold rounded-md shrink-0">
+                                残りわずかです！
                               </span>
                             )}
                           </div>
@@ -961,7 +1278,7 @@ export default function ReservationForm({
                   </div>
                   <div className="grid grid-cols-3 gap-2 border-t border-sleek-border-light pt-2">
                     <span className="text-sleek-muted font-medium text-[11px] sm:text-xs whitespace-nowrap">お受取り日</span>
-                    <span className="col-span-2 text-sleek-dark font-semibold whitespace-nowrap">{date}</span>
+                    <span className="col-span-2 text-sleek-dark font-semibold whitespace-nowrap">{getFormatLabel(date)}</span>
                   </div>
                   <div className="grid grid-cols-3 gap-2 border-t border-sleek-border-light pt-2">
                     <span className="text-sleek-muted font-medium text-[11px] sm:text-xs whitespace-nowrap">受取り時間</span>
@@ -1026,24 +1343,18 @@ export default function ReservationForm({
               </p>
             </div>
 
-            {/* Prominent Automated Confirmation Email Notification Card (UI上の強調通知) */}
-            <div className="bg-emerald-50 border-2 border-emerald-400/80 rounded-2xl p-4 sm:p-5 text-left space-y-2 shadow-xs">
+            {/* Honest Reservation Receipt & Verification Notice */}
+            <div className="bg-amber-50/90 border border-amber-300 rounded-2xl p-4 sm:p-5 text-left space-y-2 shadow-xs">
               <div className="flex items-start gap-3">
-                <div className="w-9 h-9 rounded-xl bg-emerald-600 text-white flex items-center justify-center shrink-0 mt-0.5 shadow-2xs">
-                  <Mail className="w-5 h-5" />
+                <div className="w-9 h-9 rounded-xl bg-amber-600 text-white flex items-center justify-center shrink-0 mt-0.5 shadow-2xs">
+                  <FileText className="w-5 h-5" />
                 </div>
                 <div className="space-y-1 min-w-0 flex-1">
-                  <div className="flex items-center justify-between gap-2 flex-wrap">
-                    <h4 className="font-bold text-emerald-950 text-xs sm:text-sm flex items-center gap-1.5">
-                      <span>予約確認メール（控え）を送信いたしました</span>
-                      <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                    </h4>
-                    <span className="text-[10px] bg-emerald-200/80 text-emerald-900 border border-emerald-400 font-mono font-bold px-2 py-0.2 rounded-full">
-                      配信完了 200 OK
-                    </span>
-                  </div>
-                  <p className="text-[11px] sm:text-xs text-emerald-900 leading-relaxed">
-                    ご入力いただいたメールアドレス（<strong className="underline underline-offset-2 break-all">{completedReservation?.email || email}</strong>）宛てに、ご予約内容の確認メール（控え）を自動送信いたしました。
+                  <h4 className="font-bold text-amber-950 text-xs sm:text-sm">
+                    ご予約控え（画面確認・保存用）
+                  </h4>
+                  <p className="text-[11px] sm:text-xs text-amber-900 leading-relaxed">
+                    ※確認メールの自動送信は行っておりません。下の「予約控えを表示・保存」ボタンから控えのコピー・スクリーンショット等で保存いただくか、画面上部の「予約確認・変更」からいつでもご確認いただけます。
                   </p>
                 </div>
               </div>
@@ -1071,7 +1382,7 @@ export default function ReservationForm({
                 className="w-full sm:w-auto px-5 py-3 bg-white hover:bg-stone-50 text-stone-900 border border-stone-300 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 shadow-2xs transition-all active:scale-95 cursor-pointer"
               >
                 <FileText className="w-4 h-4 text-emerald-700" />
-                <span>予約控え・確認メール通知を再表示</span>
+                <span>予約控えを表示・保存</span>
               </button>
 
               <button

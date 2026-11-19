@@ -3,7 +3,7 @@ import { Cake, SalesStopScheduleRule } from '../types';
 import { CATEGORY_LABELS } from '../data/cakes';
 import {
   updateCakeSoldOut,
-  updateCakeSchedule,
+  updateCakeStockByDate,
   bulkUpdateCakesSoldOut,
   saveCakeItem,
   deleteCakeItem,
@@ -15,6 +15,15 @@ import {
   evaluateAndExecuteSalesSchedules,
   isScheduledStopTimeElapsed,
   syncCakesFromDefaultCode,
+  compressImageDataUrlToBudget,
+  fetchBusinessDays,
+  subscribeToBusinessDays,
+  getUpcomingBusinessDays,
+  getReservableBusinessDays,
+  isBusinessDayClosed,
+  getJstTodayStr,
+  formatBusinessDateLabel,
+  formatShortBusinessDateLabel,
 } from '../lib/dbService';
 import { motion, AnimatePresence } from 'motion/react';
 import {
@@ -37,6 +46,8 @@ import {
   Upload,
   RefreshCw,
   Sparkles,
+  Package,
+  ArrowRight,
 } from 'lucide-react';
 
 const DEFAULT_FALLBACK_IMAGE = 'https://images.unsplash.com/photo-1565958011703-44f9829ba187?w=600&auto=format&fit=crop&q=80';
@@ -71,6 +82,8 @@ interface AdminCakeManagerProps {
   cakes: Cake[];
   onCakesChanged: (newCakes: Cake[]) => void;
   onToast?: (message: string) => void;
+  businessDays?: string[];
+  onNavigateToCalendar?: () => void;
 }
 
 function formatDateTimeDisplay(scheduledAt?: string): string {
@@ -79,18 +92,6 @@ function formatDateTimeDisplay(scheduledAt?: string): string {
   if (isNaN(dt.getTime())) return scheduledAt.replace('T', ' ');
   return dt.toLocaleString('ja-JP', {
     year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
-}
-
-function formatShortScheduleBadge(scheduledAt?: string): string {
-  if (!scheduledAt) return '';
-  const dt = new Date(scheduledAt);
-  if (isNaN(dt.getTime())) return scheduledAt.replace('T', ' ');
-  return dt.toLocaleString('ja-JP', {
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',
@@ -124,17 +125,28 @@ function getLocalDateStr(dateObj: Date): string {
   return `${y}-${m}-${d}`;
 }
 
-export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: AdminCakeManagerProps) {
+export default function AdminCakeManager({
+  cakes,
+  onCakesChanged,
+  onToast,
+  businessDays: externalBusinessDays,
+  onNavigateToCalendar,
+}: AdminCakeManagerProps) {
   const [editingCake, setEditingCake] = useState<Cake | null>(null);
   const [isCreatingNew, setIsCreatingNew] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [confirmDeleteCakeId, setConfirmDeleteCakeId] = useState<string | null>(null);
 
-  // Expanded cake IDs for showing description, #tags & individual schedule on demand
+  // Business days synced with 営業日設定
+  const [localBusinessDays, setLocalBusinessDays] = useState<string[]>(externalBusinessDays || []);
+  const effectiveBusinessDays = externalBusinessDays ?? localBusinessDays;
+
+  // Expanded cake IDs for showing description, #tags & per-date stock inputs
   const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>({});
   // Category / Status filter to minimize scrolling
-  const [categoryFilter, setCategoryFilter] = useState<'all' | 'hall' | 'cut' | 'soldout' | 'scheduled'>('all');
+  const [categoryFilter, setCategoryFilter] = useState<'all' | 'hall' | 'cut' | 'soldout'>('all');
 
-  // Auto Sales-Stop Scheduler State
+  // Auto Sales-Stop Scheduler State (全体一括スケジューラー)
   const [scheduleRules, setScheduleRules] = useState<SalesStopScheduleRule[]>([]);
   const [isSchedulerOpen, setIsSchedulerOpen] = useState(true);
   const [schedDate, setSchedDate] = useState<string>(() => getLocalDateStr(new Date()));
@@ -145,8 +157,9 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
   const [isSavingSchedule, setIsSavingSchedule] = useState(false);
   const [nowTick, setNowTick] = useState<number>(() => Date.now());
 
-  // Inline per-cake schedule input state: { [cakeId]: "YYYY-MM-DDTHH:mm" }
-  const [inlineCakeSchedules, setInlineCakeSchedules] = useState<Record<string, string>>({});
+  // Inline per-cake per-date stock input state
+  const [inlineCakeDateStocks, setInlineCakeDateStocks] = useState<Record<string, Record<string, string>>>({});
+  const [inlineBulkStocks, setInlineBulkStocks] = useState<Record<string, string>>({});
 
   // Form State for Cake Edit/Create Modal
   const [formId, setFormId] = useState('');
@@ -158,10 +171,43 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
   const [formDescription, setFormDescription] = useState('');
   const [formImageUrl, setFormImageUrl] = useState('');
   const [formTags, setFormTags] = useState('');
-  const [formStopSellingAt, setFormStopSellingAt] = useState('');
+  const [formStockByDate, setFormStockByDate] = useState<Record<string, string>>({});
+  const [modalBulkStock, setModalBulkStock] = useState('');
   const [imageLoadError, setImageLoadError] = useState(false);
   const [isSyncingFromCode, setIsSyncingFromCode] = useState(false);
   const fileInputRef = React.useRef<HTMLInputElement | null>(null);
+
+  // Subscribe to business days if not provided by parent
+  useEffect(() => {
+    if (externalBusinessDays !== undefined) {
+      setLocalBusinessDays(externalBusinessDays);
+      return;
+    }
+    let mounted = true;
+    fetchBusinessDays(false)
+      .then((days) => {
+        if (mounted) setLocalBusinessDays(days);
+      })
+      .catch((err) => console.warn('Failed loading business days in cake manager:', err));
+
+    const unsubscribe = subscribeToBusinessDays((days) => {
+      if (mounted) setLocalBusinessDays(days);
+    });
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+  }, [externalBusinessDays]);
+
+  const upcomingBusinessDays = useMemo(
+    () => getUpcomingBusinessDays(effectiveBusinessDays),
+    [effectiveBusinessDays]
+  );
+  const reservableBusinessDays = useMemo(
+    () => getReservableBusinessDays(effectiveBusinessDays),
+    [effectiveBusinessDays]
+  );
+  const todayJstStr = getJstTodayStr();
 
   // Load and subscribe to sales-stop scheduler rules + run periodic evaluation
   useEffect(() => {
@@ -201,7 +247,7 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
     const intervalId = window.setInterval(() => {
       setNowTick(Date.now());
       runCheck();
-    }, 10000);
+    }, 30000);
 
     return () => {
       mounted = false;
@@ -210,13 +256,43 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
     };
   }, []);
 
-  const toggleExpand = (id: string, currentStopAt?: string) => {
-    setExpandedIds((prev) => {
-      const nextOpen = !prev[id];
-      if (nextOpen && currentStopAt && !inlineCakeSchedules[id]) {
-        setInlineCakeSchedules((s) => ({ ...s, [id]: currentStopAt }));
+  const buildDateStockDraft = (cake: Cake, prefillLegacy: boolean = false): Record<string, string> => {
+    const draft: Record<string, string> = {};
+    const dateSet = new Set<string>(upcomingBusinessDays);
+    if (cake.stockByDate) {
+      for (const d of Object.keys(cake.stockByDate)) {
+        if (d >= todayJstStr) dateSet.add(d);
       }
-      return { ...prev, [id]: nextOpen };
+    }
+    const sortedDates = Array.from(dateSet).sort();
+    for (const d of sortedDates) {
+      if (cake.stockByDate && typeof cake.stockByDate[d] === 'number') {
+        draft[d] = String(cake.stockByDate[d]);
+      } else if (
+        prefillLegacy &&
+        !cake.stockByDate &&
+        typeof cake.stock === 'number' &&
+        !isBusinessDayClosed(d, todayJstStr)
+      ) {
+        draft[d] = String(cake.stock);
+      } else {
+        draft[d] = '';
+      }
+    }
+    return draft;
+  };
+
+  const toggleExpand = (cake: Cake) => {
+    setConfirmDeleteCakeId((prev) => (prev === cake.id ? null : prev));
+    setExpandedIds((prev) => {
+      const nextOpen = !prev[cake.id];
+      if (nextOpen) {
+        setInlineCakeDateStocks((s) => ({
+          ...s,
+          [cake.id]: buildDateStockDraft(cake, false),
+        }));
+      }
+      return { ...prev, [cake.id]: nextOpen };
     });
   };
 
@@ -227,11 +303,8 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
     const hall = safeCakes.filter((c) => c.category === 'hall').length;
     const cut = safeCakes.filter((c) => c.category === 'cut').length;
     const soldOut = safeCakes.filter((c) => c.isSoldOut).length;
-    const scheduled = safeCakes.filter(
-      (c) => c.stopSellingAt && !isScheduledStopTimeElapsed(c.stopSellingAt) && !c.isSoldOut
-    ).length;
-    return { all: safeCakes.length, hall, cut, soldOut, scheduled };
-  }, [safeCakes, nowTick]);
+    return { all: safeCakes.length, hall, cut, soldOut };
+  }, [safeCakes]);
 
   const activeWaitingRulesCount = useMemo(
     () =>
@@ -244,9 +317,6 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
   const filteredCakes = useMemo(() => {
     if (categoryFilter === 'all') return safeCakes;
     if (categoryFilter === 'soldout') return safeCakes.filter((c) => c.isSoldOut);
-    if (categoryFilter === 'scheduled') {
-      return safeCakes.filter((c) => Boolean(c.stopSellingAt));
-    }
     return safeCakes.filter((c) => c.category === categoryFilter);
   }, [safeCakes, categoryFilter]);
 
@@ -357,11 +427,22 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
       }
     } catch (err) {
       console.error('Bulk sold out update error:', err);
+      if (onToast) onToast(`⚠️ ${err instanceof Error ? err.message : '一括更新に失敗しました'}`);
     }
   };
 
   // Toggle Sold-out (オーダーストップ)
   const handleToggleSoldOut = async (cake: Cake) => {
+    const hasPositiveDateStock = Boolean(
+      cake.stockByDate && Object.values(cake.stockByDate).some((v) => typeof v === 'number' && v > 0)
+    );
+    if (cake.isSoldOut && typeof cake.stock === 'number' && cake.stock <= 0 && !hasPositiveDateStock) {
+      if (onToast) {
+        onToast(`⚠️「${cake.jpName}」は在庫数が0個のため自動売切中です。予約可能日ごとの在庫数を入力するか「制限なし」にして保存してください。`);
+      }
+      handleOpenEdit(cake);
+      return;
+    }
     const nextSoldOut = !cake.isSoldOut;
     try {
       const updated = await updateCakeSoldOut(cake.id, nextSoldOut);
@@ -375,30 +456,95 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
       }
     } catch (err) {
       console.error('Failed to toggle sold-out state:', err);
-      if (onToast) onToast('売り切れステータスの更新に失敗しました');
+      if (onToast) onToast(`⚠️ ${err instanceof Error ? err.message : '売り切れステータスの更新に失敗しました'}`);
     }
   };
 
-  // Save per-cake inline schedule
-  const handleSaveInlineCakeSchedule = async (cake: Cake, scheduledAtValue: string | null) => {
+  // Parse a date -> string map into validated Record<string, number> or null
+  const parseDateStockDraft = (
+    draft: Record<string, string>
+  ): { map: Record<string, number> | null; error?: string } => {
+    const result: Record<string, number> = {};
+    for (const [dateStr, rawVal] of Object.entries(draft)) {
+      const trimmed = (rawVal || '').trim();
+      if (!trimmed) continue;
+      const n = Math.floor(Number(trimmed));
+      if (isNaN(n) || n < 0) {
+        return {
+          map: null,
+          error: `${formatShortBusinessDateLabel(dateStr)}の在庫数は0以上の数字で入力してください`,
+        };
+      }
+      result[dateStr] = n;
+    }
+    return { map: Object.keys(result).length > 0 ? result : null };
+  };
+
+  // Apply bulk stock value to all reservable business days in inline editor
+  const handleApplyInlineBulkStock = (cake: Cake) => {
+    if (reservableBusinessDays.length === 0) {
+      if (onToast) onToast('⚠️ 予約可能日が設定されていません。「営業日設定」から営業日を登録してください。');
+      return;
+    }
+    const raw = (inlineBulkStocks[cake.id] || '').trim();
+    if (!raw) {
+      if (onToast) onToast('⚠️ 一括設定する在庫数を入力してください');
+      return;
+    }
+    const n = Math.floor(Number(raw));
+    if (isNaN(n) || n < 0) {
+      if (onToast) onToast('⚠️ 在庫数は0以上の数字で入力してください');
+      return;
+    }
+    setInlineCakeDateStocks((prev) => {
+      const base = prev[cake.id] || buildDateStockDraft(cake, false);
+      const next = { ...base };
+      for (const d of reservableBusinessDays) {
+        next[d] = String(n);
+      }
+      return { ...prev, [cake.id]: next };
+    });
+    if (onToast) onToast(`📝 予約可能日（${reservableBusinessDays.length}日分）に ${n}個 を入力しました。「日別在庫を保存」を押して反映してください。`);
+  };
+
+  // Save per-cake per-date stock map
+  const handleSaveInlineCakeDateStocks = async (cake: Cake, clearAll: boolean = false) => {
     try {
-      const updated = await updateCakeSchedule(cake.id, scheduledAtValue);
+      let mapToSave: Record<string, number> | null = null;
+      if (!clearAll) {
+        const draft = inlineCakeDateStocks[cake.id] || buildDateStockDraft(cake, false);
+        const parsed = parseDateStockDraft(draft);
+        if (parsed.error) {
+          if (onToast) onToast(`⚠️ ${parsed.error}`);
+          return;
+        }
+        mapToSave = parsed.map;
+      }
+
+      const updated = await updateCakeStockByDate(cake.id, mapToSave);
       onCakesChanged(updated);
-      if (!scheduledAtValue) {
-        setInlineCakeSchedules((prev) => {
-          const copy = { ...prev };
-          delete copy[cake.id];
-          return copy;
-        });
-        if (onToast) onToast(`「${cake.jpName}」の自動販売停止スケジュールを解除しました`);
-      } else {
-        if (onToast) {
-          onToast(`⏰ 「${cake.jpName}」の自動販売停止日時を ${formatDateTimeDisplay(scheduledAtValue)} に設定しました`);
+      setInlineCakeDateStocks((prev) => {
+        const copy = { ...prev };
+        delete copy[cake.id];
+        return copy;
+      });
+      setInlineBulkStocks((prev) => {
+        const copy = { ...prev };
+        delete copy[cake.id];
+        return copy;
+      });
+
+      if (onToast) {
+        if (!mapToSave) {
+          onToast(`📦「${cake.jpName}」の全日程の在庫上限を解除（制限なし）にしました`);
+        } else {
+          const count = Object.keys(mapToSave).length;
+          onToast(`📦「${cake.jpName}」の日別在庫（${count}日分）を保存しました`);
         }
       }
     } catch (err) {
-      console.error('Failed saving cake schedule:', err);
-      if (onToast) onToast('個別スケジュールの保存に失敗しました');
+      console.error('Failed saving cake stock by date:', err);
+      if (onToast) onToast(`⚠️ ${err instanceof Error ? err.message : '日別在庫数の更新に失敗しました'}`);
     }
   };
 
@@ -415,7 +561,8 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
     setFormDescription(cake.description);
     setFormImageUrl(cake.imageUrl);
     setFormTags(cake.tags ? cake.tags.join(', ') : '');
-    setFormStopSellingAt(cake.stopSellingAt || '');
+    setFormStockByDate(buildDateStockDraft(cake, true));
+    setModalBulkStock('');
     setImageLoadError(false);
   };
 
@@ -423,6 +570,10 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
   const handleOpenCreate = () => {
     setIsCreatingNew(true);
     const newId = 'cake-' + Date.now();
+    const emptyDraft: Record<string, string> = {};
+    for (const d of upcomingBusinessDays) {
+      emptyDraft[d] = '';
+    }
     setEditingCake({
       id: newId,
       name: '',
@@ -444,11 +595,12 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
     setFormDescription('');
     setFormImageUrl(DEFAULT_FALLBACK_IMAGE);
     setFormTags('新作, 限定');
-    setFormStopSellingAt('');
+    setFormStockByDate(emptyDraft);
+    setModalBulkStock('');
     setImageLoadError(false);
   };
 
-  // Image File Upload with Auto-Resizing & Compression to Data URL
+  // Image File Upload with Auto-Resizing & Adaptive Compression to Data URL
   const handleImageFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -459,41 +611,17 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
     }
 
     const reader = new FileReader();
-    reader.onload = (event) => {
+    reader.onload = async (event) => {
       const rawDataUrl = event.target?.result as string;
       if (!rawDataUrl) return;
 
-      const img = new Image();
-      img.onload = () => {
-        const maxDim = 640;
-        let width = img.width;
-        let height = img.height;
-        if (width > maxDim || height > maxDim) {
-          if (width > height) {
-            height = Math.round((height * maxDim) / width);
-            width = maxDim;
-          } else {
-            width = Math.round((width * maxDim) / height);
-            height = maxDim;
-          }
-        }
-
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(img, 0, 0, width, height);
-          const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.75);
-          setFormImageUrl(compressedDataUrl);
-          setImageLoadError(false);
-          if (onToast) onToast('📸 端末から写真を読み込み、最適化しました！');
-        } else {
-          setFormImageUrl(rawDataUrl);
-          setImageLoadError(false);
-        }
-      };
-      img.src = rawDataUrl;
+      const compressed = await compressImageDataUrlToBudget(rawDataUrl, 68_000);
+      setFormImageUrl(compressed);
+      setImageLoadError(false);
+      if (onToast) onToast('📸 端末から写真を読み込み、最適化しました！');
+    };
+    reader.onerror = () => {
+      if (onToast) onToast('⚠️ 画像ファイルの読み込みに失敗しました');
     };
     reader.readAsDataURL(file);
     e.target.value = '';
@@ -505,10 +633,12 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
     try {
       const updated = await syncCakesFromDefaultCode();
       onCakesChanged(updated);
+      setInlineCakeDateStocks({});
+      setInlineBulkStocks({});
       if (onToast) onToast('🔄 コード定義の最新ケーキ画像・情報をデータベースへ同期しました！');
     } catch (err) {
       console.error('Failed to sync cakes from code:', err);
-      if (onToast) onToast('⚠️ コード定義の同期に失敗しました');
+      if (onToast) onToast(`⚠️ ${err instanceof Error ? err.message : 'コード定義の同期に失敗しました'}`);
     } finally {
       setIsSyncingFromCode(false);
     }
@@ -526,6 +656,12 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
       return;
     }
 
+    const parsedDateStocks = parseDateStockDraft(formStockByDate);
+    if (parsedDateStocks.error) {
+      if (onToast) onToast(`⚠️ ${parsedDateStocks.error}`);
+      return;
+    }
+
     setIsSubmitting(true);
     try {
       const parsedTags = formTags
@@ -533,9 +669,25 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
         .map((t) => t.trim())
         .filter(Boolean);
 
-      const cleanStopAt = formStopSellingAt.trim() || undefined;
-      const scheduleElapsed = isScheduledStopTimeElapsed(cleanStopAt);
-      const normalizedImg = normalizeImageUrl(formImageUrl.trim()) || DEFAULT_FALLBACK_IMAGE;
+      let normalizedImg = normalizeImageUrl(formImageUrl.trim()) || DEFAULT_FALLBACK_IMAGE;
+      if (normalizedImg.startsWith('data:image/')) {
+        normalizedImg = await compressImageDataUrlToBudget(normalizedImg, 68_000);
+      }
+
+      const parsedMap = parsedDateStocks.map || undefined;
+      const hasPositiveDateStock = Boolean(
+        parsedMap && Object.values(parsedMap).some((v) => v > 0)
+      );
+      const wasSoldOutDueToLegacyZero =
+        !isCreatingNew &&
+        Boolean(editingCake?.isSoldOut) &&
+        typeof editingCake?.stock === 'number' &&
+        editingCake.stock <= 0;
+
+      const nextSoldOut =
+        wasSoldOutDueToLegacyZero && (hasPositiveDateStock || !parsedMap)
+          ? false
+          : Boolean(editingCake?.isSoldOut);
 
       const cakeToSave: Cake = {
         id: formId || 'cake-' + Date.now(),
@@ -543,28 +695,35 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
         name: formName.trim() || formJpName.trim(),
         price: Number(formPrice),
         category: formCategory,
-        portionLabel: formPortionLabel.trim() || undefined,
+        portionLabel: formPortionLabel.trim(),
         description: formDescription.trim(),
         imageUrl: normalizedImg,
-        tags: parsedTags.length > 0 ? parsedTags : ['おすすめ'],
-        isSoldOut: Boolean(editingCake?.isSoldOut) || scheduleElapsed,
-        ...(cleanStopAt ? { stopSellingAt: cleanStopAt } : {}),
-        ...(scheduleElapsed ? { autoStoppedAt: new Date().toISOString() } : {}),
+        tags: parsedTags,
+        isSoldOut: nextSoldOut,
+        ...(parsedMap ? { stockByDate: parsedMap } : {}),
+        ...(nextSoldOut && editingCake?.autoStoppedAt ? { autoStoppedAt: editingCake.autoStoppedAt } : {}),
       };
 
       const updatedList = await saveCakeItem(cakeToSave);
       onCakesChanged(updatedList);
+      setInlineCakeDateStocks((prev) => {
+        const copy = { ...prev };
+        delete copy[cakeToSave.id];
+        return copy;
+      });
       if (onToast) {
         onToast(
           isCreatingNew
             ? `「${cakeToSave.jpName}」を新規登録しました`
-            : `「${cakeToSave.jpName}」の情報を更新しました（画像反映完了）`
+            : `「${cakeToSave.jpName}」の情報を更新しました`
         );
       }
       setEditingCake(null);
     } catch (err) {
       console.error('Failed to save cake:', err);
-      if (onToast) onToast('ケーキ情報の保存に失敗しました');
+      if (onToast) {
+        onToast(`⚠️ ${err instanceof Error ? err.message : 'ケーキ情報の保存に失敗しました'}`);
+      }
     } finally {
       setIsSubmitting(false);
     }
@@ -574,13 +733,14 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
   const handleDeleteCake = async (cake: Cake) => {
     try {
       const updatedList = await deleteCakeItem(cake.id);
+      setConfirmDeleteCakeId(null);
       onCakesChanged(updatedList);
       if (onToast) {
         onToast(`「${cake.jpName}」を削除しました`);
       }
     } catch (err) {
       console.error('Failed to delete cake:', err);
-      if (onToast) onToast('ケーキの削除に失敗しました');
+      if (onToast) onToast(`⚠️ ${err instanceof Error ? err.message : 'ケーキの削除に失敗しました'}`);
     }
   };
 
@@ -607,9 +767,9 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
                 <h3 className="text-sm sm:text-base font-serif font-medium text-white tracking-wide">
                   自動販売停止スケジューラー設定
                 </h3>
-                {activeWaitingRulesCount > 0 || counts.scheduled > 0 ? (
+                {activeWaitingRulesCount > 0 ? (
                   <span className="text-[10px] sm:text-[11px] font-mono font-bold bg-amber-500 text-stone-950 px-2 py-0.5 rounded-full">
-                    稼働中スケジュール: {Math.max(activeWaitingRulesCount, counts.scheduled)}件
+                    稼働中スケジュール: {activeWaitingRulesCount}件
                   </span>
                 ) : (
                   <span className="text-[10px] font-mono text-stone-300 bg-white/10 px-2 py-0.5 rounded-full">
@@ -815,7 +975,7 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
               <div className="space-y-2">
                 <div className="flex items-center justify-between text-[11px] font-bold text-stone-600 px-1">
                   <span>登録済み自動販売停止スケジュール（{scheduleRules.length}件）</span>
-                  <span className="font-mono text-[10px] text-stone-400">※10秒ごとに自動判定・予約確定時にもリアルタイム判定されます</span>
+                  <span className="font-mono text-[10px] text-stone-400">※30秒ごとに自動判定・予約確定時にもリアルタイム判定されます</span>
                 </div>
                 <div className="divide-y divide-stone-200 border border-stone-200 rounded-xl bg-white overflow-hidden">
                   {scheduleRules.map((rule) => {
@@ -903,7 +1063,7 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
             {/* Quick Bulk Manual Override Controls */}
             <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-stone-200/80">
               <span className="text-[11px] text-stone-500">
-                💡 各ケーキの「詳細」または「編集」から、ケーキ1品ごとに異なる自動販売停止日時を設定することも可能です。
+                💡 上のスケジューラー設定から、全ケーキ・カテゴリ別・指定商品の自動販売停止タイマーをまとめて管理できます。
               </span>
               <div className="flex items-center gap-2 flex-wrap">
                 <button
@@ -960,6 +1120,53 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
               <span>新しいケーキを追加</span>
             </button>
           </div>
+        </div>
+
+        {/* Business Days Linked Banner */}
+        <div className="bg-emerald-50/70 p-3 rounded-xl border border-emerald-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+          <div className="space-y-1 min-w-0">
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <Calendar className="w-4 h-4 text-emerald-700 shrink-0" />
+              <span className="text-xs font-bold text-emerald-950">
+                営業日設定と連動中（受取可能日ごとの在庫を設定できます）
+              </span>
+            </div>
+            {reservableBusinessDays.length > 0 ? (
+              <div className="flex items-center flex-wrap gap-1">
+                <span className="text-[11px] text-emerald-900 font-medium mr-1">
+                  受付中の予約可能日 ({reservableBusinessDays.length}日):
+                </span>
+                {reservableBusinessDays.slice(0, 6).map((d) => (
+                  <span
+                    key={d}
+                    className="px-2 py-0.5 bg-white border border-emerald-200 rounded-md text-[10px] font-mono font-bold text-emerald-800"
+                  >
+                    {formatShortBusinessDateLabel(d)}
+                  </span>
+                ))}
+                {reservableBusinessDays.length > 6 && (
+                  <span className="text-[10px] font-bold text-emerald-800">
+                    +{reservableBusinessDays.length - 6}日
+                  </span>
+                )}
+              </div>
+            ) : (
+              <p className="text-[11px] text-red-700 font-semibold">
+                ⚠️ 現在、お客様が予約できる営業日（3日後以降）がありません。「営業日設定」から営業日を登録してください。
+              </p>
+            )}
+          </div>
+          {onNavigateToCalendar && (
+            <button
+              type="button"
+              onClick={onNavigateToCalendar}
+              className="px-3 py-1.5 bg-white hover:bg-emerald-100 text-emerald-900 border border-emerald-300 rounded-lg text-[11px] font-bold flex items-center gap-1 shrink-0 self-start sm:self-center cursor-pointer transition-colors"
+            >
+              <Calendar className="w-3.5 h-3.5 text-emerald-700" />
+              <span>営業日設定を開く</span>
+              <ArrowRight className="w-3 h-3" />
+            </button>
+          )}
         </div>
 
         {/* Helpful Info Tip */}
@@ -1019,20 +1226,6 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
             >
               売切中 ({counts.soldOut})
             </button>
-            <button
-              type="button"
-              onClick={() => setCategoryFilter('scheduled')}
-              className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer flex items-center gap-1 ${
-                categoryFilter === 'scheduled'
-                  ? 'bg-amber-600 text-white'
-                  : counts.scheduled > 0
-                  ? 'bg-amber-50 text-amber-900 border border-amber-300 hover:bg-amber-100'
-                  : 'bg-stone-100 text-stone-500 hover:bg-stone-200'
-              }`}
-            >
-              <Clock className="w-3 h-3" />
-              <span>自動停止予定 ({counts.scheduled})</span>
-            </button>
           </div>
 
           {filteredCakes.length > 0 && (
@@ -1043,6 +1236,12 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
                 const next: Record<string, boolean> = { ...expandedIds };
                 filteredCakes.forEach((c) => {
                   next[c.id] = !allExpanded;
+                  if (!allExpanded) {
+                    setInlineCakeDateStocks((s) => ({
+                      ...s,
+                      [c.id]: buildDateStockDraft(c, false),
+                    }));
+                  }
                 });
                 setExpandedIds(next);
               }}
@@ -1074,9 +1273,25 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
           {filteredCakes.map((cake, index) => {
             const isSoldOut = !!cake.isSoldOut;
             const isExpanded = !!expandedIds[cake.id];
-            const hasFutureSchedule =
-              Boolean(cake.stopSellingAt) && !isScheduledStopTimeElapsed(cake.stopSellingAt) && !isSoldOut;
             const wasAutoStopped = isSoldOut && Boolean(cake.autoStoppedAt);
+
+            const dateStockEntries = upcomingBusinessDays
+              .filter((d) => cake.stockByDate && typeof cake.stockByDate[d] === 'number')
+              .map((d) => ({ date: d, qty: cake.stockByDate![d] }));
+            const allReservableSoldOutByStock =
+              reservableBusinessDays.length > 0 &&
+              reservableBusinessDays.every(
+                (d) => cake.stockByDate && typeof cake.stockByDate[d] === 'number' && cake.stockByDate[d] <= 0
+              );
+
+            const draftDatesForCake = Array.from(
+              new Set([
+                ...upcomingBusinessDays,
+                ...(cake.stockByDate ? Object.keys(cake.stockByDate).filter((d) => d >= todayJstStr) : []),
+              ])
+            ).sort();
+
+            const inlineDraft = inlineCakeDateStocks[cake.id] || buildDateStockDraft(cake, false);
 
             return (
               <div
@@ -1085,8 +1300,6 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
                 className={`rounded-xl border transition-all overflow-hidden ${
                   isSoldOut
                     ? 'border-red-300 bg-red-50/40'
-                    : hasFutureSchedule
-                    ? 'border-amber-300 bg-amber-50/20'
                     : index % 2 === 0
                     ? 'border-sleek-border bg-white'
                     : 'border-sleek-border bg-[#FAF8F5]'
@@ -1117,7 +1330,7 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
                     )}
                   </div>
 
-                  {/* Center: Essential Info (Category, Name, Price, Schedule Badge) */}
+                  {/* Center: Essential Info (Category, Name, Price, Per-Date Stock Badges) */}
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center flex-wrap gap-x-1.5 gap-y-0.5 text-[10px] sm:text-[11px] text-stone-500 leading-tight">
                       <span className="font-semibold text-stone-700">
@@ -1135,16 +1348,61 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
                           <AlertCircle className="w-3 h-3" />
                           {wasAutoStopped ? '自動販売停止済' : '売切（ストップ中）'}
                         </span>
+                      ) : allReservableSoldOutByStock ? (
+                        <span className="text-red-600 font-bold inline-flex items-center gap-0.5">
+                          <AlertCircle className="w-3 h-3" />
+                          予約可能日すべて在庫0
+                        </span>
                       ) : (
                         <span className="text-emerald-700 font-bold inline-flex items-center gap-0.5">
                           <Check className="w-3 h-3" />
                           販売中
                         </span>
                       )}
-                      {hasFutureSchedule && (
-                        <span className="inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded bg-amber-100 text-amber-900 border border-amber-300 font-mono font-bold text-[10px]">
-                          <Clock className="w-2.5 h-2.5 text-amber-700" />
-                          {formatShortScheduleBadge(cake.stopSellingAt)} 停止予定
+
+                      {/* Per-Date Stock Badges */}
+                      {dateStockEntries.length > 0 ? (
+                        <>
+                          {dateStockEntries.slice(0, 3).map(({ date, qty }) => (
+                            <span
+                              key={date}
+                              className={`inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded font-bold text-[10px] border ${
+                                qty <= 0
+                                  ? 'bg-red-100 text-red-700 border-red-200'
+                                  : qty <= 10
+                                  ? 'bg-amber-100 text-amber-900 border-amber-300'
+                                  : 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                              }`}
+                            >
+                              {formatShortBusinessDateLabel(date)}: {qty <= 0 ? '売切' : `${qty}個`}
+                            </span>
+                          ))}
+                          {dateStockEntries.length > 3 && (
+                            <span className="text-[10px] font-bold text-stone-500">
+                              +{dateStockEntries.length - 3}日
+                            </span>
+                          )}
+                        </>
+                      ) : typeof cake.stock === 'number' ? (
+                        cake.stock <= 0 ? (
+                          <span className="inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded bg-red-100 text-red-700 border border-red-200 font-bold text-[10px]">
+                            <Package className="w-2.5 h-2.5" />
+                            共通在庫 0個
+                          </span>
+                        ) : cake.stock <= 10 ? (
+                          <span className="inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded bg-amber-100 text-amber-900 border border-amber-300 font-bold text-[10px]">
+                            <Package className="w-2.5 h-2.5 text-amber-700" />
+                            共通在庫 {cake.stock}個
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded bg-emerald-50 text-emerald-800 border border-emerald-200 font-bold text-[10px]">
+                            <Package className="w-2.5 h-2.5 text-emerald-700" />
+                            共通在庫 {cake.stock}個
+                          </span>
+                        )
+                      ) : (
+                        <span className="inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded bg-stone-100 text-stone-600 border border-stone-200 font-medium text-[10px]">
+                          在庫 制限なし
                         </span>
                       )}
                     </div>
@@ -1182,7 +1440,7 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
 
                     <button
                       type="button"
-                      onClick={() => toggleExpand(cake.id, cake.stopSellingAt)}
+                      onClick={() => toggleExpand(cake)}
                       aria-expanded={isExpanded}
                       className={`px-2.5 py-2 rounded-lg text-[11px] sm:text-xs font-semibold border transition-colors flex items-center gap-1 whitespace-nowrap cursor-pointer ${
                         isExpanded
@@ -1196,65 +1454,145 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
                   </div>
                 </div>
 
-                {/* Collapsible Detail Section: Individual Auto-Stop Timer, Description, #Tags, Edit & Delete */}
+                {/* Collapsible Detail Section: Per-Date Stock, Description, #Tags, Edit & Delete */}
                 {isExpanded && (
                   <div className="px-3 pb-3 pt-2 border-t border-stone-200/80 bg-stone-50/70 space-y-2.5 text-xs">
-                    {/* Individual Cake Auto-Stop Schedule Control */}
-                    <div className="bg-amber-50/70 border border-amber-200/90 rounded-lg p-2.5 space-y-1.5">
+                    {/* Inline Per-Cake Per-Date Stock Control (営業日設定と連動) */}
+                    <div className="bg-emerald-50/60 border border-emerald-200/90 rounded-lg p-2.5 space-y-2">
                       <div className="flex items-center justify-between gap-2 flex-wrap">
-                        <span className="text-[11px] font-bold text-amber-950 flex items-center gap-1">
-                          <Clock className="w-3.5 h-3.5 text-amber-700" />
-                          このケーキの自動販売停止日時（指定日時で売切へ自動移行）
+                        <span className="text-[11px] font-bold text-emerald-950 flex items-center gap-1">
+                          <Package className="w-3.5 h-3.5 text-emerald-700" />
+                          予約可能日ごとの在庫設定（営業日設定と連動）
                         </span>
-                        {cake.stopSellingAt && (
-                          <span className="text-[10px] font-mono font-bold text-amber-800">
-                            現在設定: {formatDateTimeDisplay(cake.stopSellingAt)}
-                          </span>
-                        )}
+                        <span className="text-[10px] font-bold text-emerald-900">
+                          設定済: {dateStockEntries.length}日
+                        </span>
                       </div>
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        <input
-                          type="datetime-local"
-                          value={
-                            inlineCakeSchedules[cake.id] !== undefined
-                              ? inlineCakeSchedules[cake.id]
-                              : cake.stopSellingAt || ''
-                          }
-                          onChange={(e) =>
-                            setInlineCakeSchedules((prev) => ({
-                              ...prev,
-                              [cake.id]: e.target.value,
-                            }))
-                          }
-                          className="px-2.5 py-1.5 bg-white border border-amber-300 rounded-lg text-xs font-mono text-stone-800 focus:outline-none focus:ring-1 focus:ring-sleek-gold"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const val =
-                              inlineCakeSchedules[cake.id] !== undefined
-                                ? inlineCakeSchedules[cake.id]
-                                : cake.stopSellingAt || '';
-                            if (!val) {
-                              if (onToast) onToast('⚠️ 日時を選択してください');
-                              return;
-                            }
-                            handleSaveInlineCakeSchedule(cake, val);
-                          }}
-                          className="px-2.5 py-1.5 bg-stone-900 hover:bg-black text-amber-300 rounded-lg text-[11px] font-bold cursor-pointer"
-                        >
-                          日時を保存
-                        </button>
-                        {cake.stopSellingAt && (
-                          <button
-                            type="button"
-                            onClick={() => handleSaveInlineCakeSchedule(cake, null)}
-                            className="px-2.5 py-1.5 bg-white hover:bg-red-50 text-red-600 border border-red-200 rounded-lg text-[11px] font-semibold cursor-pointer"
-                          >
-                            スケジュール解除
-                          </button>
-                        )}
-                      </div>
+
+                      {typeof cake.stock === 'number' && !cake.stockByDate && (
+                        <div className="bg-amber-50 border border-amber-200 rounded-md px-2 py-1 text-[10px] text-amber-900">
+                          ※ 現在は全日程共通の在庫（{cake.stock}個）が適用中です。日別在庫を保存すると日程ごとの管理に切り替わります。
+                        </div>
+                      )}
+
+                      {draftDatesForCake.length === 0 ? (
+                        <div className="bg-white border border-emerald-200 rounded-lg p-2.5 text-[11px] text-stone-600 flex items-center justify-between gap-2 flex-wrap">
+                          <span>「営業日設定」にこれからの営業日が登録されていません。</span>
+                          {onNavigateToCalendar && (
+                            <button
+                              type="button"
+                              onClick={onNavigateToCalendar}
+                              className="px-2.5 py-1 bg-emerald-700 text-white rounded-md text-[10px] font-bold cursor-pointer"
+                            >
+                              営業日を設定する
+                            </button>
+                          )}
+                        </div>
+                      ) : (
+                        <>
+                          {/* Quick Bulk Fill for Reservable Days */}
+                          {reservableBusinessDays.length > 0 && (
+                            <div className="flex items-center gap-1.5 flex-wrap bg-white/80 border border-emerald-200/80 rounded-lg p-1.5">
+                              <span className="text-[10px] font-semibold text-emerald-900">一括入力:</span>
+                              <input
+                                type="number"
+                                min={0}
+                                placeholder="個数"
+                                value={inlineBulkStocks[cake.id] ?? ''}
+                                onChange={(e) =>
+                                  setInlineBulkStocks((prev) => ({ ...prev, [cake.id]: e.target.value }))
+                                }
+                                className="w-20 px-2 py-1 bg-white border border-emerald-300 rounded-md text-[11px] font-mono text-stone-800 focus:outline-none focus:ring-1 focus:ring-sleek-gold"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => handleApplyInlineBulkStock(cake)}
+                                className="px-2 py-1 bg-emerald-100 hover:bg-emerald-200 text-emerald-900 border border-emerald-300 rounded-md text-[10px] font-bold cursor-pointer"
+                              >
+                                予約可能日へ反映
+                              </button>
+                            </div>
+                          )}
+
+                          {/* Date Rows */}
+                          <div className="space-y-1.5 max-h-56 overflow-y-auto pr-0.5">
+                            {draftDatesForCake.map((d) => {
+                              const isClosed = !upcomingBusinessDays.includes(d);
+                              const isReservable = !isClosed && !isBusinessDayClosed(d, todayJstStr);
+                              const val = inlineDraft[d] ?? '';
+
+                              return (
+                                <div
+                                  key={d}
+                                  className="flex items-center justify-between gap-2 bg-white border border-emerald-200/80 rounded-lg px-2.5 py-1.5"
+                                >
+                                  <div className="flex items-center gap-1.5 min-w-0 flex-wrap">
+                                    <span className="font-mono font-bold text-[11px] text-stone-800">
+                                      {formatBusinessDateLabel(d)}
+                                    </span>
+                                    {isClosed ? (
+                                      <span className="px-1.5 py-0.2 rounded bg-stone-100 text-stone-600 border border-stone-200 text-[9px] font-bold">
+                                        営業日外
+                                      </span>
+                                    ) : isReservable ? (
+                                      <span className="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-800 border border-emerald-200 text-[9px] font-bold">
+                                        受付中
+                                      </span>
+                                    ) : (
+                                      <span className="px-1.5 py-0.2 rounded bg-stone-100 text-stone-500 border border-stone-200 text-[9px] font-medium">
+                                        締切済
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  <div className="flex items-center gap-1 shrink-0">
+                                    <input
+                                      type="number"
+                                      min={0}
+                                      placeholder="制限なし"
+                                      value={val}
+                                      onChange={(e) =>
+                                        setInlineCakeDateStocks((prev) => ({
+                                          ...prev,
+                                          [cake.id]: {
+                                            ...(prev[cake.id] || buildDateStockDraft(cake, false)),
+                                            [d]: e.target.value,
+                                          },
+                                        }))
+                                      }
+                                      className="w-24 px-2 py-1 bg-white border border-emerald-300 rounded-md text-xs font-mono text-stone-800 focus:outline-none focus:ring-1 focus:ring-sleek-gold"
+                                    />
+                                    <span className="text-[11px] text-stone-600 font-medium">個</span>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+
+                          <div className="flex items-center gap-1.5 flex-wrap pt-0.5">
+                            <button
+                              type="button"
+                              onClick={() => handleSaveInlineCakeDateStocks(cake, false)}
+                              className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg text-[11px] font-bold cursor-pointer"
+                            >
+                              日別在庫を保存
+                            </button>
+                            {(cake.stockByDate || typeof cake.stock === 'number') && (
+                              <button
+                                type="button"
+                                onClick={() => handleSaveInlineCakeDateStocks(cake, true)}
+                                className="px-2.5 py-1.5 bg-white hover:bg-stone-100 text-stone-700 border border-stone-300 rounded-lg text-[11px] font-semibold cursor-pointer"
+                              >
+                                すべて制限なしに戻す
+                              </button>
+                            )}
+                          </div>
+                        </>
+                      )}
+
+                      <p className="text-[10px] text-emerald-900/80 leading-relaxed">
+                        ※ 設定数に達した日付のみ自動で売り切れになります。残り10個以下になるとお客様画面に「残りわずかです！」と表示され、キャンセル時は自動で在庫が戻ります。
+                      </p>
                     </div>
 
                     {/* English Name & Full Price info */}
@@ -1300,15 +1638,34 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
                           <Edit3 className="w-3.5 h-3.5 text-sleek-gold" />
                           <span>ケーキ情報を編集</span>
                         </button>
-                        <button
-                          type="button"
-                          onClick={() => handleDeleteCake(cake)}
-                          className="py-1.5 px-2.5 bg-white hover:bg-red-50 text-stone-400 hover:text-red-600 border border-sleek-border rounded-lg text-xs flex items-center gap-1 transition-colors cursor-pointer"
-                          title="ケーキを削除"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                          <span>削除</span>
-                        </button>
+                        {confirmDeleteCakeId === cake.id ? (
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteCake(cake)}
+                              className="py-1.5 px-2.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-bold transition-colors cursor-pointer"
+                            >
+                              本当に削除
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteCakeId(null)}
+                              className="py-1.5 px-2 bg-stone-200 hover:bg-stone-300 text-stone-700 rounded-lg text-xs font-medium transition-colors cursor-pointer"
+                            >
+                              戻る
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteCakeId(cake.id)}
+                            className="py-1.5 px-2.5 bg-white hover:bg-red-50 text-stone-400 hover:text-red-600 border border-sleek-border rounded-lg text-xs flex items-center gap-1 transition-colors cursor-pointer"
+                            title="ケーキを削除"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>削除</span>
+                          </button>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -1406,6 +1763,8 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
                     >
                       <option value="hall">ホールケーキ</option>
                       <option value="cut">カットケーキ</option>
+                      <option value="seasonal">季節限定</option>
+                      <option value="tart">タルト</option>
                     </select>
                   </div>
                   <div className="space-y-1">
@@ -1420,29 +1779,130 @@ export default function AdminCakeManager({ cakes, onCakesChanged, onToast }: Adm
                   </div>
                 </div>
 
-                {/* Auto Sales-Stop DateTime in Modal */}
-                <div className="space-y-1 bg-amber-50/70 p-3 rounded-xl border border-amber-200">
-                  <label className="font-bold text-amber-950 flex items-center justify-between gap-2">
-                    <span className="flex items-center gap-1">
-                      <Clock className="w-3.5 h-3.5 text-amber-700" />
-                      自動販売停止日時（指定日時で自動的に売切へ移行）
+                {/* Per-Date Stock Limit Setting in Modal (営業日設定と連動) */}
+                <div className="space-y-2 bg-emerald-50/70 p-3 rounded-xl border border-emerald-200">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <span className="font-bold text-emerald-950 flex items-center gap-1">
+                      <Package className="w-3.5 h-3.5 text-emerald-700" />
+                      予約可能日ごとの在庫設定（営業日設定と連動）
                     </span>
-                    {formStopSellingAt && (
+                    {Object.values(formStockByDate).some((v) => String(v).trim() !== '') && (
                       <button
                         type="button"
-                        onClick={() => setFormStopSellingAt('')}
-                        className="text-[11px] text-red-600 hover:underline font-medium"
+                        onClick={() => {
+                          const cleared: Record<string, string> = {};
+                          for (const key of Object.keys(formStockByDate)) {
+                            cleared[key] = '';
+                          }
+                          setFormStockByDate(cleared);
+                        }}
+                        className="text-[11px] text-stone-600 hover:underline font-medium cursor-pointer"
                       >
-                        クリア
+                        すべて制限なしに戻す
                       </button>
                     )}
-                  </label>
-                  <input
-                    type="datetime-local"
-                    value={formStopSellingAt}
-                    onChange={(e) => setFormStopSellingAt(e.target.value)}
-                    className="w-full px-3 py-2 bg-white border border-amber-300 rounded-xl text-xs font-mono focus:outline-none focus:ring-1 focus:ring-sleek-gold"
-                  />
+                  </div>
+
+                  {typeof editingCake?.stock === 'number' && !editingCake?.stockByDate && (
+                    <div className="bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5 text-[10px] text-amber-900">
+                      ※ 従来の共通在庫（{editingCake.stock}個）が予約可能日に引き継がれています。日程ごとに調整して保存してください。
+                    </div>
+                  )}
+
+                  {Object.keys(formStockByDate).length === 0 ? (
+                    <div className="bg-white border border-emerald-200 rounded-lg p-2.5 text-[11px] text-stone-600">
+                      現在「営業日設定」にこれからの営業日が登録されていません。営業日を設定すると、日付ごとの在庫数を入力できるようになります。
+                    </div>
+                  ) : (
+                    <>
+                      {reservableBusinessDays.length > 0 && (
+                        <div className="flex items-center gap-1.5 flex-wrap bg-white border border-emerald-200 rounded-lg p-2">
+                          <span className="text-[10px] font-bold text-emerald-950">一括設定:</span>
+                          <input
+                            type="number"
+                            min={0}
+                            placeholder="個数"
+                            value={modalBulkStock}
+                            onChange={(e) => setModalBulkStock(e.target.value)}
+                            className="w-20 px-2 py-1 bg-white border border-emerald-300 rounded-md text-xs font-mono focus:outline-none focus:ring-1 focus:ring-sleek-gold"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const raw = modalBulkStock.trim();
+                              if (!raw) return;
+                              const n = Math.floor(Number(raw));
+                              if (isNaN(n) || n < 0) return;
+                              setFormStockByDate((prev) => {
+                                const next = { ...prev };
+                                for (const d of reservableBusinessDays) {
+                                  next[d] = String(n);
+                                }
+                                return next;
+                              });
+                            }}
+                            className="px-2.5 py-1 bg-emerald-100 hover:bg-emerald-200 text-emerald-950 border border-emerald-300 rounded-md text-[10px] font-bold cursor-pointer"
+                          >
+                            予約可能日に一括反映
+                          </button>
+                        </div>
+                      )}
+
+                      <div className="space-y-1.5 max-h-48 overflow-y-auto pr-0.5">
+                        {Object.keys(formStockByDate)
+                          .sort()
+                          .map((d) => {
+                            const isClosed = !upcomingBusinessDays.includes(d);
+                            const isReservable = !isClosed && !isBusinessDayClosed(d, todayJstStr);
+                            return (
+                              <div
+                                key={d}
+                                className="flex items-center justify-between gap-2 bg-white border border-emerald-200 rounded-lg px-2.5 py-1.5"
+                              >
+                                <div className="flex items-center gap-1.5 min-w-0 flex-wrap">
+                                  <span className="font-mono font-bold text-[11px] text-stone-800">
+                                    {formatBusinessDateLabel(d)}
+                                  </span>
+                                  {isClosed ? (
+                                    <span className="px-1.5 py-0.2 rounded bg-stone-100 text-stone-600 border border-stone-200 text-[9px] font-bold">
+                                      営業日外
+                                    </span>
+                                  ) : isReservable ? (
+                                    <span className="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-800 border border-emerald-200 text-[9px] font-bold">
+                                      受付中
+                                    </span>
+                                  ) : (
+                                    <span className="px-1.5 py-0.2 rounded bg-stone-100 text-stone-500 border border-stone-200 text-[9px] font-medium">
+                                      締切済
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="flex items-center gap-1 shrink-0">
+                                  <input
+                                    type="number"
+                                    min={0}
+                                    step={1}
+                                    value={formStockByDate[d] ?? ''}
+                                    onChange={(e) =>
+                                      setFormStockByDate((prev) => ({
+                                        ...prev,
+                                        [d]: e.target.value,
+                                      }))
+                                    }
+                                    placeholder="制限なし"
+                                    className="w-24 px-2 py-1 bg-white border border-emerald-300 rounded-md text-xs font-mono focus:outline-none focus:ring-1 focus:ring-sleek-gold"
+                                  />
+                                  <span className="text-[11px] font-bold text-emerald-900 shrink-0">個</span>
+                                </div>
+                              </div>
+                            );
+                          })}
+                      </div>
+                    </>
+                  )}
+                  <p className="text-[10px] text-emerald-900/80 leading-relaxed">
+                    💡 数字を入力した日付は、予約が入るたびに自動で減り、0個になった日付のみ売り切れになります。残り10個以下になるとお客様画面に「残りわずかです！」と表示されます。
+                  </p>
                 </div>
 
                 {/* Description */}

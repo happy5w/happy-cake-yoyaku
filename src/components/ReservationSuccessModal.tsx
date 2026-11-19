@@ -63,28 +63,21 @@ export default function ReservationSuccessModal({
     minute: '2-digit'
   });
 
-  // Generate plain text confirmation email body
-  const emailSubject = '【Happy Café】ケーキご予約の確認・控え';
-  const emailSender = 'Happy Café 予約受付システム <order@happy-sweets.jp>';
-  
-  const generateEmailText = () => {
+  // Generate plain text reservation receipt for customer copy/save
+  const receiptTitle = '【Happy Café】ケーキご予約控え（お客様保存用）';
+
+  const generateReceiptText = () => {
     const itemsText = (reservation.items || []).map((item, idx) => 
       `  ${idx + 1}. ${item.cakeName} × ${item.quantity}個 (¥${(Number(item.price) || 0).toLocaleString()} / 単価) = ¥${((Number(item.price) || 0) * (Number(item.quantity) || 0)).toLocaleString()}`
     ).join('\n');
 
-    return `件名: ${emailSubject}
-送信元: ${emailSender}
-送信先: ${reservation.name} 様 <${reservation.email}>
-送信日時: ${nowStr}
+    return `${receiptTitle}
+受付日時: ${nowStr}
+ご予約者様: ${reservation.name} 様
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-【Happy Café】ケーキご予約完了のお知らせ（お客様控え）
+【Happy Café】ケーキご予約内容控え
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-${reservation.name} 様
-
-この度は「Happy Café」にてケーキをご予約いただき、誠にありがとうございます。
-以下の内容でご予約を承りましたので、ご確認をお願い申し上げます。
 
 ■ ご予約内容
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -105,22 +98,23 @@ ${reservation.notes ? `  ・備考連絡: ${reservation.notes}\n` : ''}---------
 ・お代金はお受け取り時に店頭レジにてお支払いをお願いいたします。
 
 ■ ご予約の確認・キャンセルについて
-・アプリ内の「ご予約状況の照会・確認」画面にて、メールアドレスまたはお電話番号でいつでも予約内容の確認やキャンセルが可能です。
-・ご不明点やお受取り日時の変更がございましたら、お電話にてご連絡ください。
+・予約サイトの「予約確認・変更」画面にて、12/18（金）の締切までは予約内容の確認やキャンセルが可能です。
+・締切後のキャンセル・変更はWebからは行えませんので、お電話のみで承ります。
+・ご入力いただいたお電話番号へ、事前に確認の連絡を入れる場合がございます。
 
 ────────────────────────────
-Happy Café (パティスリーカフェ)
-〒260-0000 千葉県千葉市美浜区
-TEL: 043-239-2520 (受付時間: 9:00〜18:00)
-URL: https://happy-sweets.jp
+Happy Café (ハッピー製菓調理専門学校 1F)
+〒260-0021 千葉県千葉市中央区新宿2-6-21
+TEL: 043-239-2520（受付時間：平日 9：00～17：30）
+※事前に確認の連絡を入れる場合がございます。
 ────────────────────────────
-※本メールはご予約完了時に自動送信された控え通知です。`;
+※確認メールの自動送信は行っておりませんので、こちらの控えまたはスクリーンショットを大切に保管してください。`;
   };
 
-  const handleCopyEmail = () => {
-    navigator.clipboard.writeText(generateEmailText()).then(() => {
+  const handleCopyReceipt = () => {
+    navigator.clipboard.writeText(generateReceiptText()).then(() => {
       setCopied(true);
-      if (onToast) onToast('📋 確認メール本文をクリップボードにコピーしました');
+      if (onToast) onToast('📋 予約控えテキストをクリップボードにコピーしました');
       setTimeout(() => setCopied(false), 3000);
     });
   };
@@ -174,23 +168,22 @@ URL: https://happy-sweets.jp
               </div>
             </div>
 
-            {/* Simulated Email Sent Notification Highlight (UI上の強調通知) */}
-            <div className="mt-3.5 sm:mt-4 bg-emerald-950/80 border border-emerald-500/50 rounded-2xl p-3 sm:p-3.5 text-xs text-emerald-100 flex items-start gap-3 shadow-inner">
-              <div className="w-7 h-7 rounded-xl bg-emerald-600 text-white flex items-center justify-center shrink-0 mt-0.5">
-                <Mail className="w-4 h-4" />
+            {/* Honest On-Screen Receipt Guidance Banner */}
+            <div className="mt-3.5 sm:mt-4 bg-amber-950/60 border border-amber-400/50 rounded-2xl p-3 sm:p-3.5 text-xs text-amber-100 flex items-start gap-3 shadow-inner">
+              <div className="w-7 h-7 rounded-xl bg-amber-600 text-white flex items-center justify-center shrink-0 mt-0.5">
+                <FileText className="w-4 h-4" />
               </div>
               <div className="space-y-0.5 min-w-0 flex-1">
                 <div className="flex items-center justify-between gap-2 flex-wrap">
-                  <strong className="font-bold text-white text-xs sm:text-sm flex items-center gap-1.5">
-                    <span>【自動送信】予約確認メール（控え）を送信しました</span>
-                    <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
+                  <strong className="font-bold text-white text-xs sm:text-sm">
+                    ご予約控え（画面保存・メモ用）
                   </strong>
                   <span className="text-[10px] font-mono bg-emerald-800/80 text-emerald-200 border border-emerald-600/60 px-2 py-0.2 rounded-full">
-                    送信ステータス: 配信済
+                    予約登録完了
                   </span>
                 </div>
-                <p className="text-[11px] text-emerald-200/90 leading-relaxed">
-                  ご入力いただいたメールアドレス（<span className="font-bold text-white underline underline-offset-2 break-all">{reservation.email}</span>）宛てに、以下の予約確認控えメールを送信いたしました。
+                <p className="text-[11px] text-amber-100/95 leading-relaxed">
+                  ※確認メールの自動送信は行っておりません。画面のスクリーンショット・下の「予約控えをコピー」・印刷などで保管いただくか、「予約確認・変更」画面（<span className="font-bold text-white underline underline-offset-2 break-all">{reservation.email}</span>）からいつでも確認できます。
                 </p>
               </div>
             </div>
@@ -220,11 +213,8 @@ URL: https://happy-sweets.jp
                   : 'border-transparent text-stone-600 hover:text-stone-900'
               }`}
             >
-              <Mail className="w-4 h-4 text-emerald-600" />
-              <span>送信メール控えプレビュー</span>
-              <span className="text-[10px] bg-emerald-100 text-emerald-800 px-1.5 py-0.2 rounded-full font-mono">
-                メール本文
-              </span>
+              <FileText className="w-4 h-4 text-emerald-600" />
+              <span>予約控えテキスト（保存用）</span>
             </button>
           </div>
 
@@ -337,41 +327,41 @@ URL: https://happy-sweets.jp
                   <ul className="list-disc list-inside space-y-1 text-stone-600 text-[11px] leading-relaxed">
                     <li>受取日時に店舗カウンターへお越しいただき、スタッフにお名前（<strong>{reservation.name} 様</strong>）をお伝えください。</li>
                     <li>お代金は店頭レジにてお支払い（現金・各種キャッシュレス対応）となります。</li>
-                    <li>予約内容の確認やキャンセルは、アプリ上部の「ご予約状況の照会・確認」画面からいつでも可能です。</li>
+                    <li>予約内容の確認は、画面上部の「予約確認・変更」からいつでも可能です（Webからのキャンセルは12/18（金）まで。締切後のキャンセル・変更はお電話 043-239-2520／平日 9：00～17：30 のみで承ります）。</li>
+                    <li>ご予約内容について、事前に確認の連絡を入れる場合がございます。</li>
                   </ul>
                 </div>
               </div>
             ) : (
-              /* Simulated Email View (送信確認メール控え) */
+              /* Plain Text Receipt View (お客様保存用テキスト控え) */
               <div className="space-y-3">
-                {/* Email Client Header Preview */}
+                {/* Receipt Header */}
                 <div className="bg-stone-50 border border-stone-300 rounded-2xl p-4 text-xs font-mono space-y-1.5">
                   <div className="flex justify-between items-center pb-2 border-b border-stone-200">
-                    <span className="font-bold text-emerald-700 flex items-center gap-1.5 font-sans">
-                      <Mail className="w-4 h-4 text-emerald-600" />
-                      送信済みメール控え（自動配信通知）
+                    <span className="font-bold text-stone-800 flex items-center gap-1.5 font-sans">
+                      <FileText className="w-4 h-4 text-amber-600" />
+                      ご予約控えテキスト（メモ・保存用）
                     </span>
                     <span className="text-[10px] bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded font-bold font-sans">
-                      配信完了 200 OK
+                      予約確定済
                     </span>
                   </div>
                   <div className="space-y-1 pt-1 text-[11px]">
-                    <p><strong className="text-stone-500">件名:</strong> <span className="font-bold text-stone-900">{emailSubject}</span></p>
-                    <p><strong className="text-stone-500">差出人:</strong> {emailSender}</p>
-                    <p><strong className="text-stone-500">宛先:</strong> {reservation.name} 様 &lt;{reservation.email}&gt;</p>
-                    <p><strong className="text-stone-500">送信日時:</strong> {nowStr}</p>
+                    <p><strong className="text-stone-500">お名前:</strong> <span className="font-bold text-stone-900">{reservation.name} 様</span></p>
+                    <p><strong className="text-stone-500">お受取日時:</strong> {formattedDate} {reservation.time}</p>
+                    <p><strong className="text-stone-500">受付日時:</strong> {nowStr}</p>
                   </div>
                 </div>
 
-                {/* Email Plain Text Body Box */}
+                {/* Receipt Plain Text Body Box */}
                 <div className="relative">
                   <pre className="bg-stone-900 text-stone-100 p-4 sm:p-5 rounded-2xl text-xs font-mono whitespace-pre-wrap leading-relaxed overflow-x-auto max-h-[380px] border border-stone-700 shadow-inner selection:bg-amber-500 selection:text-black">
-                    {generateEmailText()}
+                    {generateReceiptText()}
                   </pre>
 
                   <button
                     type="button"
-                    onClick={handleCopyEmail}
+                    onClick={handleCopyReceipt}
                     className="absolute top-3 right-3 px-3 py-1.5 bg-white/90 hover:bg-white text-stone-900 rounded-xl text-xs font-bold font-sans flex items-center gap-1.5 shadow-md active:scale-95 transition-all cursor-pointer"
                   >
                     {copied ? (
@@ -382,7 +372,7 @@ URL: https://happy-sweets.jp
                     ) : (
                       <>
                         <Copy className="w-3.5 h-3.5 text-stone-700" />
-                        <span>メール本文をコピー</span>
+                        <span>控えをコピー</span>
                       </>
                     )}
                   </button>
@@ -396,12 +386,12 @@ URL: https://happy-sweets.jp
             <div className="flex items-center gap-2 w-full sm:w-auto">
               <button
                 type="button"
-                onClick={handleCopyEmail}
+                onClick={handleCopyReceipt}
                 className="flex-1 sm:flex-initial px-3.5 py-2.5 bg-white hover:bg-stone-100 text-stone-800 border border-stone-300 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 shadow-2xs transition-colors cursor-pointer"
-                title="メール本文をコピー"
+                title="予約控えをコピー"
               >
                 {copied ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4 text-stone-600" />}
-                <span>{copied ? 'コピーしました' : 'メール控えをコピー'}</span>
+                <span>{copied ? 'コピーしました' : '予約控えをコピー'}</span>
               </button>
 
               <button

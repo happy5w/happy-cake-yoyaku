@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Calendar as CalendarIcon, Check, HelpCircle, Save } from 'lucide-react';
-import { fetchBusinessDays, saveBusinessDays, subscribeToBusinessDays } from '../lib/dbService';
+import { fetchBusinessDays, saveBusinessDays, subscribeToBusinessDays, isBusinessDayClosed } from '../lib/dbService';
 
 interface BusinessDaysCalendarProps {
   onSaved: () => void;
@@ -170,7 +170,7 @@ export default function BusinessDaysCalendar({ onSaved }: BusinessDaysCalendarPr
             </span>
           )}
           {syncStatus === 'error' && (
-            <span className="text-[11px] text-red-650 bg-red-50 border border-red-200 px-3 py-1.5 rounded-xl font-semibold text-center">
+            <span className="text-[11px] text-red-600 bg-red-50 border border-red-200 px-3 py-1.5 rounded-xl font-semibold text-center">
               保存に失敗しました。再試行してください
             </span>
           )}
@@ -206,14 +206,12 @@ export default function BusinessDaysCalendar({ onSaved }: BusinessDaysCalendarPr
 
       {/* Info Warning banner block */}
       <div className="bg-amber-50/50 border border-amber-100 rounded-2xl p-4 text-xs text-amber-900 leading-relaxed space-y-1">
-        <p className="font-bold flex items-center gap-1.5 text-amber-850">
+        <p className="font-bold flex items-center gap-1.5 text-amber-900">
           <HelpCircle className="w-4 h-4 text-sleek-gold shrink-0" />
-          💡 3日前自動予約締め切りルールについて
+          💡 ご予約締め切りルールについて
         </p>
         <p className="text-stone-700">
-          ここで設定された営業日は、その営業日当日から起算して<strong className="text-sleek-dark font-bold">3日前の段階で自動的に予約が締め切られ</strong>、お客様の画面（カレンダー選択画面）から自動で非表示または非活性になります。
-          <br />
-          <em>例: 12月24日を営業日に設定した場合、3日前にあたる12月21日の23:59までで予約は締め切られ、12月22日以降は予約出来なくなります。</em>
+          ご予約の受付締切は<strong className="text-sleek-dark font-bold">2026年12月18日（金）23:59まで</strong>に設定されています。締切日を過ぎると、お客様の画面から予約受付が自動的に終了します（当日および過去の営業日も受付終了となります）。
         </p>
       </div>
 
@@ -274,20 +272,19 @@ export default function BusinessDaysCalendar({ onSaved }: BusinessDaysCalendarPr
               const isPast = formattedDate < todayStr;
               const isToday = formattedDate === todayStr;
 
-              // Calculate days until booking deadline
-              const diffMs = new Date(formattedDate + "T00:00:00+09:00").getTime() - new Date(todayStr + "T00:00:00+09:00").getTime();
-              const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
-              const isClosed = isSelected && diffDays < 3;
+              // Check whether booking deadline (12/18) or pickup date has passed
+              const isClosed = isSelected && isBusinessDayClosed(formattedDate, todayStr);
 
               return (
                 <button
                   key={`day-${day}`}
                   type="button"
+                  disabled={isPast}
                   onClick={() => handleDayToggle(formattedDate)}
                   className={`aspect-square rounded-xl flex flex-col items-center justify-between p-1.5 relative transition-all border text-xs font-semibold ${
                     isSelected
                       ? isClosed
-                        ? 'bg-amber-100 hover:bg-amber-20s border-amber-300 text-amber-900 ring-1 ring-amber-200'
+                        ? 'bg-amber-100 hover:bg-amber-200 border-amber-300 text-amber-900 ring-1 ring-amber-200'
                         : 'bg-sleek-dark hover:bg-black border-sleek-dark text-white shadow-sm'
                       : 'bg-white border-sleek-border/40 hover:bg-sleek-cream text-sleek-text'
                   } ${isPast ? 'opacity-40 cursor-not-allowed bg-stone-50' : 'cursor-pointer'}`}
@@ -319,10 +316,7 @@ export default function BusinessDaysCalendar({ onSaved }: BusinessDaysCalendarPr
             <div className="max-h-56 overflow-y-auto space-y-1.5 pr-1 divide-y divide-sleek-border/20">
               {selectedDays.map(dateStr => {
                 const isPast = dateStr < todayStr;
-                // Deadline computation
-                const diffMs = new Date(dateStr + "T00:00:00+09:00").getTime() - new Date(todayStr + "T00:00:00+09:00").getTime();
-                const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
-                const isClosed = diffDays < 3;
+                const isClosed = isBusinessDayClosed(dateStr, todayStr);
 
                 return (
                   <div key={dateStr} className="flex items-center justify-between py-1.5 first:pt-0">
@@ -335,7 +329,7 @@ export default function BusinessDaysCalendar({ onSaved }: BusinessDaysCalendarPr
                       ) : isClosed ? (
                         <span className="text-amber-800 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-100 font-bold">予約締切</span>
                       ) : (
-                        <span className="text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-155 font-bold">予約受付中 (残り{diffDays - 3}日)</span>
+                        <span className="text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200 font-bold">予約受付中 (12/18締切)</span>
                       )}
                       <button
                         type="button"

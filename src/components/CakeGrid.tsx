@@ -1,21 +1,41 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useRef } from 'react';
 import { Cake } from '../types';
 import { CAKES, CATEGORY_LABELS } from '../data/cakes';
+import {
+  getEffectiveStockForDate,
+  isCakeSoldOutForDate,
+  formatShortBusinessDateLabel,
+  isReservationDeadlinePassed,
+} from '../lib/dbService';
 import { motion, AnimatePresence } from 'motion/react';
-import { Plus, Minus, ShoppingBag, Info, Check, Sparkles } from 'lucide-react';
+import { Plus, Minus, ShoppingBag, Info, Check, Sparkles, AlertCircle, Calendar } from 'lucide-react';
 
 const FALLBACK_CAKE_IMAGE = 'https://images.unsplash.com/photo-1565958011703-44f9829ba187?w=600&auto=format&fit=crop&q=80';
 
 interface CakeGridProps {
-  onAddToCart: (cake: Cake, quantity: number) => void;
+  onAddToCart: (cake: Cake, quantity: number) => boolean | void;
+  onWarning?: (message: string) => void;
   cart: { [cakeId: string]: number };
   cakes?: Cake[];
+  reservableDays?: string[];
+  selectedPickupDate?: string;
+  onSelectPickupDate?: (date: string) => void;
 }
 
-export default function CakeGrid({ onAddToCart, cart, cakes = CAKES }: CakeGridProps) {
+export default function CakeGrid({
+  onAddToCart,
+  onWarning,
+  cart,
+  cakes = CAKES,
+  reservableDays,
+  selectedPickupDate,
+  onSelectPickupDate,
+}: CakeGridProps) {
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
   const [selectedCake, setSelectedCake] = useState<Cake | null>(null);
   const [quantities, setQuantities] = useState<{ [cakeId: string]: number }>({});
+  const [limitAlert, setLimitAlert] = useState<{ cakeId: string; message: string } | null>(null);
+  const alertTimerRef = useRef<number | null>(null);
 
   const categories = useMemo(() => {
     const presentCats = Array.from(new Set(cakes.map(c => c.category))).filter(Boolean);
@@ -42,23 +62,168 @@ export default function CakeGrid({ onAddToCart, cart, cakes = CAKES }: CakeGridP
     return quantities[cakeId] || 1;
   };
 
-  const handleAdjustQuantity = (cakeId: string, delta: number) => {
-    setQuantities(prev => {
-      const current = prev[cakeId] || 1;
-      const next = Math.max(1, current + delta);
-      return { ...prev, [cakeId]: next };
-    });
+  const totalCartQty = useMemo(
+    () => Object.values(cart).reduce((sum, qty) => sum + (qty as number), 0),
+    [cart]
+  );
+
+  const showLimitWarning = (cakeId: string, message: string) => {
+    if (alertTimerRef.current) {
+      window.clearTimeout(alertTimerRef.current);
+    }
+    setLimitAlert({ cakeId, message });
+    if (onWarning) {
+      onWarning(message);
+    }
+    alertTimerRef.current = window.setTimeout(() => {
+      setLimitAlert(prev => (prev?.cakeId === cakeId ? null : prev));
+      alertTimerRef.current = null;
+    }, 3500);
   };
 
-  const handleAddClick = (cake: Cake) => {
+  const handleAdjustQuantity = (cake: Cake, delta: number) => {
+    const current = quantities[cake.id] || 1;
+    const next = current + delta;
+
+    if (delta > 0) {
+      const inCartForCake = cart[cake.id] || 0;
+      const effectiveStock = getEffectiveStockForDate(cake, selectedPickupDate);
+
+      if (totalCartQty + next > 10) {
+        const msg = totalCartQty > 0
+          ? `⚠️ 1回のご予約で10個までです！（現在カートに${totalCartQty}個入っています）`
+          : '⚠️ 1回のご予約で10個までです！';
+        showLimitWarning(cake.id, msg);
+        return;
+      }
+
+      if (cake.category === 'hall' && inCartForCake + next > 2) {
+        showLimitWarning(cake.id, `⚠️ ホールケーキ（${cake.jpName}）は各種2台までです。`);
+        return;
+      }
+
+      if (typeof effectiveStock === 'number' && inCartForCake + next > effectiveStock) {
+        showLimitWarning(
+          cake.id,
+          effectiveStock <= 10
+            ? `⚠️「${cake.jpName}」は残りわずかのため、これ以上追加できません。`
+            : `⚠️「${cake.jpName}」の在庫上限（${effectiveStock}個）を超えるため追加できません。`
+        );
+        return;
+      }
+    }
+
+    const clamped = Math.max(1, next);
+    setQuantities(prev => ({ ...prev, [cake.id]: clamped }));
+    if (limitAlert?.cakeId === cake.id) {
+      setLimitAlert(null);
+    }
+  };
+
+  const handleAddClick = (cake: Cake): boolean => {
+    if (reservableDays !== undefined && reservableDays.length === 0) {
+      showLimitWarning(cake.id, '現在ご予約可能な営業日が設定されていないため、カートに追加できません。');
+      return false;
+    }
+    if (isCakeSoldOutForDate(cake, selectedPickupDate)) {
+      showLimitWarning(cake.id, `⚠️「${cake.jpName}」は選択中のお受取り日において売り切れとなっております。`);
+      return false;
+    }
+
     const qty = getQuantity(cake.id);
-    onAddToCart(cake, qty);
-    // Add success feedback (could reset quantity field)
+    const inCartForCake = cart[cake.id] || 0;
+    const effectiveStock = getEffectiveStockForDate(cake, selectedPickupDate);
+
+    if (totalCartQty + qty > 10) {
+      const msg = totalCartQty > 0
+        ? `⚠️ 1回のご予約で10個までです！（現在カートに${totalCartQty}個入っています）`
+        : '⚠️ 1回のご予約で10個までです！';
+      showLimitWarning(cake.id, msg);
+      return false;
+    }
+
+    if (cake.category === 'hall' && inCartForCake + qty > 2) {
+      showLimitWarning(cake.id, `⚠️ ホールケーキ（${cake.jpName}）は各種2台までです。`);
+      return false;
+    }
+
+    if (typeof effectiveStock === 'number' && inCartForCake + qty > effectiveStock) {
+      showLimitWarning(
+        cake.id,
+        effectiveStock <= 10
+          ? `⚠️「${cake.jpName}」は残りわずかのため追加できません。`
+          : `⚠️「${cake.jpName}」の在庫上限（${effectiveStock}個）を超えるため追加できません。`
+      );
+      return false;
+    }
+
+    const result = onAddToCart(cake, qty);
+    if (result === false) {
+      return false;
+    }
     setQuantities(prev => ({ ...prev, [cake.id]: 1 }));
+    if (limitAlert?.cakeId === cake.id) {
+      setLimitAlert(null);
+    }
+    return true;
   };
 
   return (
-    <div id="cake-catalog-section" className="space-y-6 sm:space-y-8">
+    <div id="cake-catalog-section" className="space-y-5 sm:space-y-7">
+      {/* Pickup Date Selector Linked to Business Days */}
+      {reservableDays !== undefined && (
+        <div className="bg-white border border-sleek-border rounded-2xl p-3.5 sm:p-4 shadow-xs max-w-4xl mx-auto">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+            <div className="flex items-center gap-1.5 text-xs font-bold text-sleek-dark shrink-0">
+              <Calendar className="w-4 h-4 text-sleek-gold shrink-0" />
+              <span>お受取り希望日（予約可能日）:</span>
+            </div>
+            {reservableDays.length === 0 ? (
+              <p className="text-[11px] sm:text-xs text-amber-800 font-medium">
+                {isReservationDeadlinePassed()
+                  ? 'ご予約受付は12/18（金）をもって終了いたしました。'
+                  : '現在ご予約可能な営業日が設定されていません（締切：12/18（金）まで）。'}
+              </p>
+            ) : (
+              <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar py-0.5">
+                {reservableDays.map((d) => {
+                  const isActive = selectedPickupDate === d;
+                  return (
+                    <button
+                      key={d}
+                      type="button"
+                      onClick={() => {
+                        onSelectPickupDate?.(d);
+                        const conflictNames: string[] = [];
+                        for (const [cakeId, qty] of Object.entries(cart)) {
+                          if (!qty || qty <= 0) continue;
+                          const c = cakes.find(item => item.id === cakeId);
+                          if (!c) continue;
+                          const eff = getEffectiveStockForDate(c, d);
+                          if (isCakeSoldOutForDate(c, d) || (typeof eff === 'number' && qty > eff)) {
+                            conflictNames.push(c.jpName);
+                          }
+                        }
+                        if (conflictNames.length > 0 && onWarning) {
+                          onWarning(`⚠️ ${formatShortBusinessDateLabel(d)}はカート内の「${conflictNames.join('・')}」が売り切れまたは在庫不足です。カート画面でご確認ください。`);
+                        }
+                      }}
+                      className={`whitespace-nowrap px-3 py-1.5 rounded-xl text-xs font-mono font-bold transition-all shrink-0 cursor-pointer border ${
+                        isActive
+                          ? 'bg-sleek-dark text-[#D4AF37] border-sleek-dark shadow-xs'
+                          : 'bg-sleek-bg text-sleek-dark border-sleek-border hover:bg-sleek-cream'
+                      }`}
+                    >
+                      {formatShortBusinessDateLabel(d)}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Category Nav */}
       <div className="flex items-center justify-center overflow-x-auto no-scrollbar gap-1.5 sm:gap-3 border-b border-sleek-border pb-4 px-1 -mx-2 sm:mx-0">
         {categories.map((cat) => {
@@ -97,6 +262,10 @@ export default function CakeGrid({ onAddToCart, cart, cakes = CAKES }: CakeGridP
         {filteredCakes.map((cake) => {
           const cartQty = cart[cake.id] || 0;
           const safeTags = Array.isArray(cake.tags) ? cake.tags : [];
+          const isSoldOut = isCakeSoldOutForDate(cake, selectedPickupDate);
+          const effectiveStock = getEffectiveStockForDate(cake, selectedPickupDate);
+          const isLowStock = !isSoldOut && typeof effectiveStock === 'number' && effectiveStock > 0 && effectiveStock <= 10;
+
           return (
             <div
               key={cake.id}
@@ -115,7 +284,7 @@ export default function CakeGrid({ onAddToCart, cart, cakes = CAKES }: CakeGridP
                 <img
                   src={cake.imageUrl}
                   alt={cake.jpName}
-                  className={`w-full h-full object-cover transition-transform duration-700 ${cake.isSoldOut ? 'grayscale-[60%]' : 'group-hover:scale-105'}`}
+                  className={`w-full h-full object-cover transition-transform duration-700 ${isSoldOut ? 'grayscale-[60%]' : 'group-hover:scale-105'}`}
                   referrerPolicy="no-referrer"
                   onError={(e) => {
                     const target = e.currentTarget as HTMLImageElement;
@@ -124,7 +293,7 @@ export default function CakeGrid({ onAddToCart, cart, cakes = CAKES }: CakeGridP
                     }
                   }}
                 />
-                {cake.isSoldOut && (
+                {isSoldOut && (
                   <div className="absolute inset-0 bg-stone-950/65 backdrop-blur-[1px] flex flex-col items-center justify-center p-3 text-center z-10">
                     <span className="bg-red-600 text-white font-bold text-xs sm:text-sm px-3.5 py-1 rounded-full shadow-lg tracking-wider whitespace-nowrap">
                       売り切れ
@@ -145,7 +314,7 @@ export default function CakeGrid({ onAddToCart, cart, cakes = CAKES }: CakeGridP
                     </span>
                   ))}
                 </div>
-                {cartQty > 0 && !cake.isSoldOut && (
+                {cartQty > 0 && !isSoldOut && (
                   <div className="absolute top-2.5 right-2.5 sm:top-3 sm:right-3 bg-sleek-dark text-white text-[10px] px-2.5 sm:px-3 py-0.5 sm:py-1 rounded-full font-bold shadow-md flex items-center gap-1 tracking-wider uppercase border border-sleek-border/30 whitespace-nowrap">
                     <Check className="w-3 h-3 text-sleek-gold shrink-0" />
                     カート: {cartQty}個
@@ -181,57 +350,77 @@ export default function CakeGrid({ onAddToCart, cart, cakes = CAKES }: CakeGridP
                 </div>
 
                 {/* Pricing & Cart Action */}
-                <div className="pt-3 border-t border-sleek-border flex items-center justify-between gap-2">
-                  <div className="min-w-0">
-                    <span className="text-sleek-muted text-[9px] sm:text-[10px] tracking-wider block uppercase font-mono leading-tight whitespace-nowrap">
-                      {cake.portionLabel || (cake.id === 'buche-de-noel' ? '長さ１８㎝' : cake.id === 'rice-chou' ? '１つ' : cake.category === 'hall' ? '４号（直径１５㎝）' : cake.category === 'cut' ? '１カット' : 'テイクアウト価格')}
-                    </span>
-                    <div className="flex items-baseline gap-0.5 sm:gap-1 whitespace-nowrap">
-                      <span className="text-lg sm:text-2xl font-light font-sans text-sleek-gold leading-none">
-                        ¥{(Number(cake.price) || 0).toLocaleString()}
+                <div className="pt-3 border-t border-sleek-border space-y-2">
+                  {isLowStock && (
+                    <div>
+                      <span className="inline-flex items-center gap-1 text-[10px] font-bold text-amber-800 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full whitespace-nowrap">
+                        残りわずかです！
                       </span>
-                      <span className="text-sleek-muted text-[9px] sm:text-[10px]">（税込）</span>
                     </div>
-                  </div>
+                  )}
 
-                  {/* Quantity Action Counter & Add button */}
-                  {cake.isSoldOut ? (
-                    <span className="text-[11px] sm:text-xs px-2.5 sm:px-3 py-1.5 sm:py-2 rounded-xl bg-red-50 text-red-700 font-bold border border-red-200 whitespace-nowrap shrink-0">
-                      売り切れ
-                    </span>
-                  ) : (
-                    <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-                      <div className="flex items-center border border-sleek-border rounded-xl bg-sleek-bg overflow-hidden h-8 sm:h-10">
-                        <button
-                          id={`btn-qty-minus-${cake.id}`}
-                          onClick={() => handleAdjustQuantity(cake.id, -1)}
-                          className="px-2 sm:px-3 text-sleek-muted hover:bg-sleek-cream hover:text-sleek-dark h-full transition-colors active:bg-stone-200"
-                          aria-label="数量を減らす"
-                        >
-                          <Minus className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
-                        </button>
-                        <span className="px-1.5 sm:px-2 pb-[1px] font-semibold text-sleek-dark text-xs sm:text-sm font-mono min-w-[18px] sm:min-w-[20px] text-center">
-                          {getQuantity(cake.id)}
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <span className="text-sleek-muted text-[9px] sm:text-[10px] tracking-wider block uppercase font-mono leading-tight whitespace-nowrap">
+                        {cake.portionLabel || (cake.id === 'buche-de-noel' ? '長さ１８㎝' : cake.id === 'rice-chou' ? '１つ' : cake.category === 'hall' ? '４号（直径１５㎝）' : cake.category === 'cut' ? '１カット' : 'テイクアウト価格')}
+                      </span>
+                      <div className="flex items-baseline gap-0.5 sm:gap-1 whitespace-nowrap">
+                        <span className="text-lg sm:text-2xl font-light font-sans text-sleek-gold leading-none">
+                          ¥{(Number(cake.price) || 0).toLocaleString()}
                         </span>
+                        <span className="text-sleek-muted text-[9px] sm:text-[10px]">（税込）</span>
+                      </div>
+                    </div>
+
+                    {/* Quantity Action Counter & Add button */}
+                    {isSoldOut ? (
+                      <span className="text-[11px] sm:text-xs px-2.5 sm:px-3 py-1.5 sm:py-2 rounded-xl bg-red-50 text-red-700 font-bold border border-red-200 whitespace-nowrap shrink-0">
+                        売り切れ
+                      </span>
+                    ) : (
+                      <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+                        <div className="flex items-center border border-sleek-border rounded-xl bg-sleek-bg overflow-hidden h-8 sm:h-10">
+                          <button
+                            id={`btn-qty-minus-${cake.id}`}
+                            onClick={() => handleAdjustQuantity(cake, -1)}
+                            className="px-2 sm:px-3 text-sleek-muted hover:bg-sleek-cream hover:text-sleek-dark h-full transition-colors active:bg-stone-200"
+                            aria-label="数量を減らす"
+                          >
+                            <Minus className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
+                          </button>
+                          <span className="px-1.5 sm:px-2 pb-[1px] font-semibold text-sleek-dark text-xs sm:text-sm font-mono min-w-[18px] sm:min-w-[20px] text-center">
+                            {getQuantity(cake.id)}
+                          </span>
+                          <button
+                            id={`btn-qty-plus-${cake.id}`}
+                            onClick={() => handleAdjustQuantity(cake, 1)}
+                            className="px-2 sm:px-3 text-sleek-muted hover:bg-sleek-cream hover:text-sleek-dark h-full transition-colors active:bg-stone-200"
+                            aria-label="数量を増やす"
+                          >
+                            <Plus className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
+                          </button>
+                        </div>
+
                         <button
-                          id={`btn-qty-plus-${cake.id}`}
-                          onClick={() => handleAdjustQuantity(cake.id, 1)}
-                          className="px-2 sm:px-3 text-sleek-muted hover:bg-sleek-cream hover:text-sleek-dark h-full transition-colors active:bg-stone-200"
-                          aria-label="数量を増やす"
+                          id={`btn-add-to-cart-${cake.id}`}
+                          onClick={() => handleAddClick(cake)}
+                          className="bg-sleek-dark hover:bg-black text-white h-8 sm:h-10 px-2.5 sm:px-3.5 rounded-xl transition-all shadow-md flex items-center justify-center gap-1 border border-sleek-border-light shrink-0 active:scale-95 whitespace-nowrap"
+                          title="カートに追加"
                         >
-                          <Plus className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
+                          <ShoppingBag className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-sleek-gold shrink-0" />
+                          <span className="text-[11px] sm:text-xs font-semibold">追加</span>
                         </button>
                       </div>
+                    )}
+                  </div>
 
-                      <button
-                        id={`btn-add-to-cart-${cake.id}`}
-                        onClick={() => handleAddClick(cake)}
-                        className="bg-sleek-dark hover:bg-black text-white h-8 sm:h-10 px-2.5 sm:px-3.5 rounded-xl transition-all shadow-md flex items-center justify-center gap-1 border border-sleek-border-light shrink-0 active:scale-95 whitespace-nowrap"
-                        title="カートに追加"
-                      >
-                        <ShoppingBag className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-sleek-gold shrink-0" />
-                        <span className="text-[11px] sm:text-xs font-semibold">追加</span>
-                      </button>
+                  {limitAlert?.cakeId === cake.id && (
+                    <div
+                      role="alert"
+                      className="text-[11px] font-bold text-red-700 bg-red-50 border border-red-200 rounded-xl px-2.5 py-1.5 flex items-center gap-1.5"
+                    >
+                      <AlertCircle className="w-3.5 h-3.5 text-red-600 shrink-0" />
+                      <span>{limitAlert.message.replace(/^⚠️\s*/, '')}</span>
                     </div>
                   )}
                 </div>
@@ -287,10 +476,22 @@ export default function CakeGrid({ onAddToCart, cart, cakes = CAKES }: CakeGridP
               {/* Title & Body */}
               <div className="p-4 sm:p-6 space-y-3.5 sm:space-y-4 overflow-y-auto flex-grow">
                 <div>
-                  <div className="flex items-center gap-2 mb-1">
+                  <div className="flex items-center gap-2 mb-1 flex-wrap">
                     <span className="bg-sleek-cream text-sleek-gold border border-sleek-border-light text-[10px] tracking-wider font-bold font-mono px-2.5 py-0.5 rounded-full uppercase">
                       {CATEGORY_LABELS[selectedCake.category as keyof typeof CATEGORY_LABELS]}
                     </span>
+                    {(() => {
+                      const modalSoldOut = isCakeSoldOutForDate(selectedCake, selectedPickupDate);
+                      const modalStock = getEffectiveStockForDate(selectedCake, selectedPickupDate);
+                      if (!modalSoldOut && typeof modalStock === 'number' && modalStock > 0 && modalStock <= 10) {
+                        return (
+                          <span className="text-[10px] font-bold text-amber-800 bg-amber-50 border border-amber-200 px-2.5 py-0.5 rounded-full">
+                            残りわずかです！
+                          </span>
+                        );
+                      }
+                      return null;
+                    })()}
                   </div>
                   <h2 className="text-xl sm:text-2xl font-light text-sleek-dark font-serif">
                     {selectedCake.jpName}
@@ -336,6 +537,16 @@ export default function CakeGrid({ onAddToCart, cart, cakes = CAKES }: CakeGridP
                   </div>
                 </div>
 
+                {limitAlert?.cakeId === selectedCake.id && (
+                  <div
+                    role="alert"
+                    className="text-xs font-bold text-red-700 bg-red-50 border border-red-200 rounded-xl px-3 py-2 flex items-center gap-1.5"
+                  >
+                    <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+                    <span>{limitAlert.message.replace(/^⚠️\s*/, '')}</span>
+                  </div>
+                )}
+
                 {/* Close and action */}
                 <div className="flex items-center justify-between pt-2 gap-3">
                   <div>
@@ -344,7 +555,7 @@ export default function CakeGrid({ onAddToCart, cart, cakes = CAKES }: CakeGridP
                       ¥{(Number(selectedCake.price) || 0).toLocaleString()}
                     </span>
                   </div>
-                  {selectedCake.isSoldOut ? (
+                  {isCakeSoldOutForDate(selectedCake, selectedPickupDate) ? (
                     <button
                       disabled
                       className="bg-stone-200 text-stone-500 font-bold text-xs tracking-wider uppercase px-4 sm:px-5 py-3 rounded-xl cursor-not-allowed border border-stone-300"
@@ -355,8 +566,10 @@ export default function CakeGrid({ onAddToCart, cart, cakes = CAKES }: CakeGridP
                     <button
                       id="btn-modal-add-to-cart"
                       onClick={() => {
-                        onAddToCart(selectedCake, getQuantity(selectedCake.id));
-                        setSelectedCake(null);
+                        const added = handleAddClick(selectedCake);
+                        if (added) {
+                          setSelectedCake(null);
+                        }
                       }}
                       className="bg-sleek-dark hover:bg-black text-white font-semibold text-xs tracking-wider uppercase px-4 sm:px-5 py-3 rounded-xl transition-all shadow-md flex items-center gap-2 active:scale-95"
                     >

@@ -12,6 +12,8 @@ export interface Cake {
   category: 'hall' | 'cut' | 'seasonal' | 'tart';
   tags: string[];
   isSoldOut?: boolean;
+  stock?: number;
+  stockByDate?: Record<string, number>;
   portionLabel?: string;
   stopSellingAt?: string;
   autoStoppedAt?: string;

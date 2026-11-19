@@ -9,12 +9,17 @@ import {
   saveSheetsConfig,
   clearSheetsConfig,
   googleLogin,
-  fetchCakes,
+  fetchCakesStrict,
   fetchCancellationNotifications,
   markCancellationNotificationRead,
   markAllCancellationNotificationsRead,
   subscribeToReservations,
-  evaluateAndExecuteSalesSchedules
+  evaluateAndExecuteSalesSchedules,
+  getFriendlyFirebaseErrorMessage,
+  fetchBusinessDays,
+  subscribeToBusinessDays,
+  deleteReservation,
+  deleteAllReservations
 } from '../lib/dbService';
 import { 
   createReservationsSheet, 
@@ -52,7 +57,8 @@ import {
   ArrowRight,
   Printer,
   Bell,
-  Settings
+  Settings,
+  Trash2
 } from 'lucide-react';
 import BusinessDaysCalendar from './BusinessDaysCalendar';
 import AdminCakeManager from './AdminCakeManager';
@@ -83,14 +89,25 @@ export default function AdminDashboard({
   const [filteredReservations, setFilteredReservations] = useState<Reservation[]>([]);
   const [cancelNotifications, setCancelNotifications] = useState<CancellationNotification[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [filterStatus, setFilterStatus] = useState<string>('all');
   const [filterDate, setFilterDate] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedReservation, setSelectedReservation] = useState<Reservation | null>(null);
   const [showKitchenPrep, setShowKitchenPrep] = useState(true);
 
-  // Cakes State
+  // Cakes & Business Days State
   const [cakesList, setCakesList] = useState<Cake[]>(externalCakes || []);
+  const [businessDays, setBusinessDays] = useState<string[]>([]);
+
+  // Delete Reservation / Wipe All Reservations Modal State
+  const [showDeleteAllModal, setShowDeleteAllModal] = useState(false);
+  const [restoreStockOnDeleteAll, setRestoreStockOnDeleteAll] = useState(true);
+  const [deleteAllPassword, setDeleteAllPassword] = useState('');
+  const [deleteAllPasswordError, setDeleteAllPasswordError] = useState<string | null>(null);
+  const [isDeletingAll, setIsDeletingAll] = useState(false);
+  const [confirmDeleteSingleId, setConfirmDeleteSingleId] = useState<string | null>(null);
+  const [isDeletingSingle, setIsDeletingSingle] = useState(false);
 
   // Stats
   const [totalSales, setTotalSales] = useState(0);
@@ -115,7 +132,7 @@ export default function AdminDashboard({
   // Load cakes if not passed from parent
   useEffect(() => {
     if (!externalCakes || externalCakes.length === 0) {
-      fetchCakes().then(items => {
+      fetchCakesStrict(false).then(items => {
         setCakesList(items);
       }).catch(err => console.error('Failed to load cakes in admin:', err));
     } else {
@@ -417,34 +434,69 @@ export default function AdminDashboard({
 
   const loadData = async () => {
     setIsLoading(true);
+    setLoadError(null);
     try {
       const data = await fetchReservations();
       setReservations(data);
       const notifs = await fetchCancellationNotifications(data);
       setCancelNotifications(notifs);
-      const cakesData = await fetchCakes();
+      const cakesData = await fetchCakesStrict(true);
       setCakesList(cakesData);
       if (onCakesUpdated) onCakesUpdated(cakesData);
     } catch (err) {
       console.error('Failed to load reservations for admin:', err);
+      setLoadError(getFriendlyFirebaseErrorMessage(err, 'load'));
     } finally {
       setIsLoading(false);
     }
   };
 
   useEffect(() => {
-    loadData();
+    let active = true;
+    setIsLoading(true);
+    setLoadError(null);
 
-    const unsubscribe = subscribeToReservations((updatedReservations, updatedNotifs, newlyCancelled) => {
-      setReservations(updatedReservations);
-      setCancelNotifications(updatedNotifs);
-      if (newlyCancelled.length > 0 && onToast) {
-        const names = newlyCancelled.map(r => `${r.name} 様（${r.date}）`).join('、');
-        onToast(`🚨 予約キャンセル通知：${names} の予約がキャンセルされました`);
-      }
+    fetchCakesStrict(false)
+      .then((cakesData) => {
+        if (!active) return;
+        setCakesList(cakesData);
+        if (onCakesUpdated) onCakesUpdated(cakesData);
+      })
+      .catch((err) => {
+        console.error('Failed loading cakes for admin:', err);
+        if (active) setLoadError(getFriendlyFirebaseErrorMessage(err, 'load'));
+      });
+
+    fetchBusinessDays(false)
+      .then((days) => {
+        if (active) setBusinessDays(days);
+      })
+      .catch((err) => console.warn('Failed loading business days in admin:', err));
+
+    const unsubscribeBusinessDays = subscribeToBusinessDays((days) => {
+      if (active) setBusinessDays(days);
     });
 
-    // Periodically evaluate scheduled sales-stop timers even when admin is on another tab
+    const unsubscribe = subscribeToReservations(
+      (updatedReservations, updatedNotifs, newlyCancelled) => {
+        if (!active) return;
+        setReservations(updatedReservations);
+        setCancelNotifications(updatedNotifs);
+        setLoadError(null);
+        setIsLoading(false);
+        if (newlyCancelled.length > 0 && onToast) {
+          const names = newlyCancelled.map(r => `${r.name} 様（${r.date}）`).join('、');
+          onToast(`🚨 予約キャンセル通知：${names} の予約がキャンセルされました`);
+        }
+      },
+      (err) => {
+        if (!active) return;
+        setLoadError(getFriendlyFirebaseErrorMessage(err, 'load'));
+        setIsLoading(false);
+      }
+    );
+
+    // Periodically evaluate scheduled sales-stop timers (uses 60s cached reads)
     const schedulerInterval = window.setInterval(async () => {
       try {
         const schedRes = await evaluateAndExecuteSalesSchedules();
@@ -460,10 +512,12 @@ export default function AdminDashboard({
       } catch (err) {
         console.warn('Admin background scheduler check notice:', err);
       }
-    }, 10000);
+    }, 30000);
 
     return () => {
+      active = false;
       unsubscribe();
+      unsubscribeBusinessDays();
       window.clearInterval(schedulerInterval);
     };
   }, []);
@@ -525,20 +579,36 @@ export default function AdminDashboard({
   }, [reservations, filterStatus, filterDate, searchQuery]);
 
   const handleStatusChange = async (id: string, newStatus: ReservationStatus) => {
+    const prevStatus = reservations.find(r => r.id === id)?.status;
     try {
       await updateReservationStatus(id, newStatus);
       const nowIso = new Date().toISOString();
-      const nextList = reservations.map(r =>
-        r.id === id
-          ? { ...r, status: newStatus, updatedAt: nowIso, ...(newStatus === 'cancelled' ? { cancelledAt: nowIso } : {}) }
-          : r
-      );
+      const nextList = reservations.map(r => {
+        if (r.id !== id) return r;
+        const updatedRow: Reservation = { ...r, status: newStatus, updatedAt: nowIso };
+        if (newStatus === 'cancelled') {
+          updatedRow.cancelledAt = nowIso;
+        } else {
+          delete updatedRow.cancelledAt;
+        }
+        return updatedRow;
+      });
       setReservations(nextList);
       const notifs = await fetchCancellationNotifications(nextList);
       setCancelNotifications(notifs);
       
       if (selectedReservation?.id === id) {
         setSelectedReservation(prev => prev ? { ...prev, status: newStatus } : null);
+      }
+      if (newStatus === 'cancelled' || prevStatus === 'cancelled') {
+        fetchCakesStrict(true)
+          .then((freshCakes) => {
+            if (Array.isArray(freshCakes) && freshCakes.length > 0) {
+              setCakesList(freshCakes);
+              if (onCakesUpdated) onCakesUpdated(freshCakes);
+            }
+          })
+          .catch(() => {});
       }
       if (onToast) {
         const labelMap: Record<ReservationStatus, string> = {
@@ -549,13 +619,95 @@ export default function AdminDashboard({
         };
         onToast(
           newStatus === 'cancelled'
-            ? '🚨 予約をキャンセルし、スタッフ通知およびキャンセルリストに反映しました'
+            ? '🚨 予約をキャンセルし、スタッフ通知および在庫・キャンセルリストに反映しました'
+            : prevStatus === 'cancelled'
+            ? `ステータスを「${labelMap[newStatus]}」に戻し、在庫数を再反映しました`
             : `ステータスを「${labelMap[newStatus]}」に更新しました`
         );
       }
     } catch (err) {
       console.error('Failed to patch status:', err);
-      if (onToast) onToast('⚠️ ステータスの更新に失敗しました。');
+      if (onToast) {
+        onToast(`⚠️ ${err instanceof Error && err.message ? err.message : 'ステータスの更新に失敗しました。'}`);
+      }
+    }
+  };
+
+  const handleDeleteAllReservations = async () => {
+    if (isDeletingAll) return;
+    const normalizedPassword = deleteAllPassword
+      .trim()
+      .replace(/[０-９]/g, (s) => String.fromCharCode(s.charCodeAt(0) - 0xFEE0))
+      .replace(/[-\s]/g, '');
+
+    if (normalizedPassword !== '07064685230') {
+      setDeleteAllPasswordError('管理者パスワードが正しくありません。');
+      return;
+    }
+
+    setDeleteAllPasswordError(null);
+    setIsDeletingAll(true);
+    try {
+      const { deletedCount } = await deleteAllReservations({ restoreStock: restoreStockOnDeleteAll });
+      setReservations([]);
+      setCancelNotifications([]);
+      setSelectedReservation(null);
+      setConfirmDeleteSingleId(null);
+      setDeleteAllPassword('');
+      setDeleteAllPasswordError(null);
+      setShowDeleteAllModal(false);
+      if (restoreStockOnDeleteAll) {
+        try {
+          const freshCakes = await fetchCakesStrict(true);
+          if (Array.isArray(freshCakes) && freshCakes.length > 0) {
+            setCakesList(freshCakes);
+            if (onCakesUpdated) onCakesUpdated(freshCakes);
+          }
+        } catch {}
+      }
+      if (onToast) {
+        onToast(`🗑️ ${deletedCount > 0 ? `${deletedCount}件の` : ''}予約データをすべて削除（初期化）しました`);
+      }
+    } catch (err) {
+      console.error('Failed to delete all reservations:', err);
+      if (onToast) {
+        onToast(`⚠️ ${err instanceof Error && err.message ? err.message : '予約データの一括削除に失敗しました。'}`);
+      }
+    } finally {
+      setIsDeletingAll(false);
+    }
+  };
+
+  const handleDeleteSingleReservation = async (res: Reservation) => {
+    if (isDeletingSingle) return;
+    setIsDeletingSingle(true);
+    try {
+      const shouldRestore = res.status !== 'cancelled';
+      await deleteReservation(res.id, { restoreStock: shouldRestore });
+      const nextList = reservations.filter(r => r.id !== res.id);
+      setReservations(nextList);
+      setCancelNotifications(prev => prev.filter(n => n.reservationId !== res.id));
+      setSelectedReservation(null);
+      setConfirmDeleteSingleId(null);
+      if (shouldRestore) {
+        try {
+          const freshCakes = await fetchCakesStrict(true);
+          if (Array.isArray(freshCakes) && freshCakes.length > 0) {
+            setCakesList(freshCakes);
+            if (onCakesUpdated) onCakesUpdated(freshCakes);
+          }
+        } catch {}
+      }
+      if (onToast) {
+        onToast(`🗑️ ${res.name} 様の予約データを削除しました`);
+      }
+    } catch (err) {
+      console.error('Failed to delete reservation:', err);
+      if (onToast) {
+        onToast(`⚠️ ${err instanceof Error && err.message ? err.message : '予約データの削除に失敗しました。'}`);
+      }
+    } finally {
+      setIsDeletingSingle(false);
     }
   };
 
@@ -651,7 +803,6 @@ export default function AdminDashboard({
             <span className="text-sleek-gold text-[10px] font-bold tracking-widest uppercase font-mono bg-sleek-gold/10 px-2.5 py-0.5 rounded-full border border-sleek-gold/30">
               管理者専用画面
             </span>
-            <span className="text-stone-300 text-[10px] font-mono">暗証コード：07064685230</span>
             {unreadCancelNotifications.length > 0 && (
               <span className="bg-red-600 text-white text-[10px] font-bold px-2.5 py-0.5 rounded-full flex items-center gap-1">
                 <Bell className="w-3 h-3" />
@@ -684,6 +835,22 @@ export default function AdminDashboard({
           </button>
         </div>
       </div>
+
+      {loadError && (
+        <div className="bg-amber-50 border border-amber-300 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-amber-950 shadow-xs">
+          <div className="flex items-start gap-2.5 text-xs sm:text-sm font-bold">
+            <AlertCircle className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+            <span>{loadError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={loadData}
+            className="px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-xl transition-colors whitespace-nowrap self-end sm:self-center cursor-pointer"
+          >
+            再読み込み
+          </button>
+        </div>
+      )}
 
       {/* Staff / Admin Cancellation Notification Alert Banner */}
       {unreadCancelNotifications.length > 0 && (
@@ -1150,6 +1317,23 @@ export default function AdminDashboard({
                     <Settings className="w-3.5 h-3.5" />
                     <span className="hidden sm:inline">連携設定</span>
                   </button>
+
+                  {/* Delete All Reservations Button */}
+                  <button
+                    type="button"
+                    id="btn-delete-all-reservations"
+                    onClick={() => {
+                      setRestoreStockOnDeleteAll(true);
+                      setDeleteAllPassword('');
+                      setDeleteAllPasswordError(null);
+                      setShowDeleteAllModal(true);
+                    }}
+                    className="px-3 py-1.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-300 rounded-lg text-xs font-bold flex items-center gap-1.5 shadow-2xs active:scale-95 cursor-pointer"
+                    title="テスト予約など現在の予約データをすべて削除して初期化します"
+                  >
+                    <Trash2 className="w-3.5 h-3.5 text-red-600" />
+                    <span>予約を全削除</span>
+                  </button>
                 </div>
               </div>
 
@@ -1516,8 +1700,9 @@ export default function AdminDashboard({
 
                           {/* Individual Cake Quantity Columns */}
                           {cakesList.map(cake => {
-                            const found = safeItems.find(i => i.cakeId === cake.id || i.cakeName === cake.jpName);
-                            const qty = found ? found.quantity : 0;
+                            const qty = safeItems
+                              .filter(i => i.cakeId === cake.id || i.cakeName === cake.jpName)
+                              .reduce((sum, i) => sum + (Number(i.quantity) || 0), 0);
                             return (
                               <td
                                 key={cake.id}
@@ -1591,8 +1776,10 @@ export default function AdminDashboard({
                         const sumCake = filteredReservations
                           .filter(r => r.status !== 'cancelled')
                           .reduce((acc, r) => {
-                            const found = r.items.find(i => i.cakeId === cake.id || i.cakeName === cake.jpName);
-                            return acc + (found ? found.quantity : 0);
+                            const itemSum = (r.items || [])
+                              .filter(i => i.cakeId === cake.id || i.cakeName === cake.jpName)
+                              .reduce((s, i) => s + (Number(i.quantity) || 0), 0);
+                            return acc + itemSum;
                           }, 0);
                         return (
                           <td key={cake.id} className="border border-stone-300 px-2 py-2 text-center font-mono text-[#0d652d] bg-[#E6F4EA]">
@@ -1655,6 +1842,8 @@ export default function AdminDashboard({
             cakes={cakesList}
             onCakesChanged={handleCakesChanged}
             onToast={onToast}
+            businessDays={businessDays}
+            onNavigateToCalendar={() => setActiveTab('calendar')}
           />
         </div>
       )}
@@ -1845,36 +2034,180 @@ export default function AdminDashboard({
               </div>
 
               {/* Action buttons inside drawer footer */}
-              <div className="border-t border-sleek-border pt-5 flex items-center gap-3">
-                {selectedReservation.status === 'pending' && (
-                  <button
-                    onClick={() => handleStatusChange(selectedReservation.id, 'confirmed')}
-                    className="flex-1 bg-sleek-dark hover:bg-black text-white font-semibold py-3 rounded-xl transition-all shadow-md flex items-center justify-center gap-1.5 border border-sleek-border-light cursor-pointer text-xs uppercase tracking-wider active:scale-95"
-                  >
-                    <Check className="w-4 h-4 text-sleek-gold" />
-                    確定
-                  </button>
-                )}
-                {selectedReservation.status === 'confirmed' && (
-                  <button
-                    onClick={() => handleStatusChange(selectedReservation.id, 'completed')}
-                    className="flex-1 bg-emerald-700 hover:bg-emerald-800 text-white font-semibold py-3 rounded-xl transition-all shadow-md flex items-center justify-center gap-1.5 cursor-pointer text-xs uppercase tracking-wider active:scale-95"
-                  >
-                    <CheckCircle className="w-4 h-4" />
-                    お渡し完了
-                  </button>
-                )}
-                {selectedReservation.status !== 'cancelled' && selectedReservation.status !== 'completed' && (
-                  <button
-                    onClick={() => handleStatusChange(selectedReservation.id, 'cancelled')}
-                    className="px-4 bg-white border border-sleek-border text-sleek-muted hover:text-red-600 font-medium py-3 rounded-xl transition-colors flex items-center justify-center gap-1 cursor-pointer text-xs active:scale-95"
-                  >
-                    <X className="w-4 h-4" />
-                    却下
-                  </button>
-                )}
+              <div className="border-t border-sleek-border pt-5 space-y-3">
+                <div className="flex items-center gap-3">
+                  {selectedReservation.status === 'pending' && (
+                    <button
+                      onClick={() => handleStatusChange(selectedReservation.id, 'confirmed')}
+                      className="flex-1 bg-sleek-dark hover:bg-black text-white font-semibold py-3 rounded-xl transition-all shadow-md flex items-center justify-center gap-1.5 border border-sleek-border-light cursor-pointer text-xs uppercase tracking-wider active:scale-95"
+                    >
+                      <Check className="w-4 h-4 text-sleek-gold" />
+                      確定
+                    </button>
+                  )}
+                  {selectedReservation.status === 'confirmed' && (
+                    <button
+                      onClick={() => handleStatusChange(selectedReservation.id, 'completed')}
+                      className="flex-1 bg-emerald-700 hover:bg-emerald-800 text-white font-semibold py-3 rounded-xl transition-all shadow-md flex items-center justify-center gap-1.5 cursor-pointer text-xs uppercase tracking-wider active:scale-95"
+                    >
+                      <CheckCircle className="w-4 h-4" />
+                      お渡し完了
+                    </button>
+                  )}
+                  {selectedReservation.status !== 'cancelled' && selectedReservation.status !== 'completed' && (
+                    <button
+                      onClick={() => handleStatusChange(selectedReservation.id, 'cancelled')}
+                      className="px-4 bg-white border border-sleek-border text-sleek-muted hover:text-red-600 font-medium py-3 rounded-xl transition-colors flex items-center justify-center gap-1 cursor-pointer text-xs active:scale-95"
+                    >
+                      <X className="w-4 h-4" />
+                      キャンセル
+                    </button>
+                  )}
+                </div>
+
+                {/* Single Reservation Permanent Delete (2-step) */}
+                <div className="flex items-center justify-between pt-2 border-t border-stone-200/80 text-xs">
+                  {confirmDeleteSingleId === selectedReservation.id ? (
+                    <div className="flex items-center justify-between gap-2 w-full bg-red-50 border border-red-200 rounded-xl px-3 py-2">
+                      <span className="text-[11px] font-bold text-red-800">この予約データを完全に削除しますか？</span>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          disabled={isDeletingSingle}
+                          onClick={() => handleDeleteSingleReservation(selectedReservation)}
+                          className="px-2.5 py-1 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded-lg text-[11px] font-bold cursor-pointer"
+                        >
+                          {isDeletingSingle ? '削除中...' : '完全に削除'}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isDeletingSingle}
+                          onClick={() => setConfirmDeleteSingleId(null)}
+                          className="px-2.5 py-1 bg-white border border-stone-300 text-stone-700 rounded-lg text-[11px] font-medium cursor-pointer"
+                        >
+                          戻る
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDeleteSingleId(selectedReservation.id)}
+                      className="text-stone-500 hover:text-red-600 text-[11px] font-medium flex items-center gap-1 cursor-pointer ml-auto"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>このテスト予約データを削除する</span>
+                    </button>
+                  )}
+                </div>
               </div>
             </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Delete All Reservations Confirmation Modal */}
+      <AnimatePresence>
+        {showDeleteAllModal && (
+          <motion.div
+            id="delete-all-reservations-modal"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 bg-stone-950/80 backdrop-blur-sm flex items-center justify-center p-4"
+            onClick={() => !isDeletingAll && setShowDeleteAllModal(false)}
+          >
+            <motion.form
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              onClick={(e) => e.stopPropagation()}
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleDeleteAllReservations();
+              }}
+              className="bg-white rounded-2xl max-w-md w-full p-6 border border-stone-200 shadow-2xl space-y-4"
+            >
+              <div className="flex items-start gap-3">
+                <div className="w-10 h-10 rounded-full bg-red-100 text-red-600 flex items-center justify-center shrink-0">
+                  <Trash2 className="w-5 h-5" />
+                </div>
+                <div className="space-y-1">
+                  <h3 className="font-bold text-stone-900 text-base">
+                    すべての予約データを削除（初期化）しますか？
+                  </h3>
+                  <p className="text-xs text-stone-600 leading-relaxed">
+                    現在登録されている予約データ（全{reservations.length}件）およびキャンセル通知履歴をデータベースとこの端末から完全に削除します。この操作は元に戻せません。
+                  </p>
+                </div>
+              </div>
+
+              <label className="flex items-start gap-2.5 bg-amber-50 border border-amber-200 rounded-xl p-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={restoreStockOnDeleteAll}
+                  onChange={(e) => setRestoreStockOnDeleteAll(e.target.checked)}
+                  className="mt-0.5 rounded accent-amber-700"
+                />
+                <span className="text-xs text-amber-950 leading-relaxed font-medium">
+                  テスト予約等で減っていた商品の在庫数も元に戻す（おすすめ）
+                </span>
+              </label>
+
+              <div className="space-y-1.5">
+                <label
+                  htmlFor="delete-all-password-input"
+                  className="block text-xs font-bold text-stone-800"
+                >
+                  管理者パスワードを入力してください
+                </label>
+                <input
+                  id="delete-all-password-input"
+                  type="password"
+                  inputMode="numeric"
+                  autoComplete="off"
+                  value={deleteAllPassword}
+                  onChange={(e) => {
+                    setDeleteAllPassword(e.target.value);
+                    if (deleteAllPasswordError) setDeleteAllPasswordError(null);
+                  }}
+                  placeholder="管理者パスワード"
+                  disabled={isDeletingAll}
+                  className={`w-full px-3.5 py-2.5 rounded-xl border text-sm font-mono focus:outline-none focus:ring-2 ${
+                    deleteAllPasswordError
+                      ? 'border-red-400 bg-red-50/40 focus:ring-red-400'
+                      : 'border-stone-300 bg-white focus:ring-red-500'
+                  }`}
+                />
+                {deleteAllPasswordError && (
+                  <p className="text-xs font-bold text-red-600">{deleteAllPasswordError}</p>
+                )}
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  disabled={isDeletingAll}
+                  onClick={() => {
+                    setDeleteAllPassword('');
+                    setDeleteAllPasswordError(null);
+                    setShowDeleteAllModal(false);
+                  }}
+                  className="px-4 py-2 bg-stone-100 hover:bg-stone-200 text-stone-700 rounded-xl text-xs font-semibold cursor-pointer disabled:opacity-50"
+                >
+                  キャンセル
+                </button>
+                <button
+                  type="submit"
+                  id="btn-confirm-delete-all-reservations"
+                  disabled={isDeletingAll || !deleteAllPassword.trim()}
+                  className="px-4 py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-sm"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>{isDeletingAll ? '削除しています...' : 'すべて削除を実行する'}</span>
+                </button>
+              </div>
+            </motion.form>
           </motion.div>
         )}
       </AnimatePresence>

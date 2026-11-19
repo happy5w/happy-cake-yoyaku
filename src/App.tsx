@@ -1,28 +1,50 @@
-import React, { useState, useEffect } from 'react';
-import { Cake, Reservation } from './types';
+import React, { useState, useEffect, useMemo } from 'react';
+import { Cake, Reservation, SalesStopScheduleRule } from './types';
 import { CAKES } from './data/cakes';
 import CakeGrid from './components/CakeGrid';
 import ReservationForm from './components/ReservationForm';
 import AdminDashboard from './components/AdminDashboard';
 import CustomerCalendarModal from './components/CustomerCalendarModal';
 import StaffPickupMode from './components/StaffPickupMode';
+import { PWAInstallButton } from './components/PWAInstallButton';
+import { OfflineIndicator } from './components/OfflineIndicator';
 import { 
-  initializeDatabase, subscribeToAuth, googleLogin, userSignOut, saveMockSession, fetchReservations, updateReservationStatus, fetchCakes, subscribeToCakes, fetchBusinessDays, evaluateAndExecuteSalesSchedules
+  initializeDatabase,
+  subscribeToAuth,
+  googleLogin,
+  userSignOut,
+  saveMockSession,
+  fetchReservations,
+  updateReservationStatus,
+  fetchCakesStrict,
+  fetchBusinessDaysStrict,
+  fetchSalesStopRules,
+  applySalesStopRulesInMemory,
+  getReservableBusinessDays,
+  getEffectiveStockForDate,
+  isCakeSoldOutForDate,
+  isReservationDeadlinePassed,
+  getJstTodayStr,
+  getFriendlyFirebaseErrorMessage
 } from './lib/dbService';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
-  ShoppingBag, Calendar, Lock, Users, Sparkles, Check, Database, FileText, ArrowRight, X, Heart, Clock
+  ShoppingBag, Calendar, Lock, Sparkles, FileText, ArrowRight, X, Clock, AlertCircle, RefreshCw
 } from 'lucide-react';
 // @ts-ignore
 export default function App() {
   const [activeTab, setActiveTab] = useState<'catalog' | 'checkout' | 'history' | 'admin'>('catalog');
   const [cart, setCart] = useState<{ [cakeId: string]: number }>({});
-  const [dbAvailable, setDbAvailable] = useState<boolean | null>(null);
   const [isBusinessDaysOpen, setIsBusinessDaysOpen] = useState(false);
+  const [isPrivacyPolicyOpen, setIsPrivacyPolicyOpen] = useState(false);
   const [user, setUser] = useState<{ email: string | null; isManager: boolean; displayName: string | null; uid: string | null } | null>(null);
   
-  // Dynamic Cakes list
+  // Dynamic Cakes, Business Days & Global Sales-Stop Rules
   const [cakes, setCakes] = useState<Cake[]>(CAKES);
+  const [businessDays, setBusinessDays] = useState<string[]>([]);
+  const [salesStopRules, setSalesStopRules] = useState<SalesStopScheduleRule[]>([]);
+  const [selectedPickupDate, setSelectedPickupDate] = useState<string>('');
+  const [scheduleTick, setScheduleTick] = useState<number>(0);
 
   // Staff Pickup Quick Mode (hpy001)
   const [isStaffMode, setIsStaffMode] = useState(false);
@@ -32,39 +54,70 @@ export default function App() {
   const [myReservations, setMyReservations] = useState<Reservation[]>([]);
   const [searchAttempted, setSearchAttempted] = useState(false);
   const [isSearchingHistory, setIsSearchingHistory] = useState(false);
+  const [historyLoadError, setHistoryLoadError] = useState<string | null>(null);
   const [cancellingResId, setCancellingResId] = useState<string | null>(null);
+  const [isCancellingSubmit, setIsCancellingSubmit] = useState(false);
+
+  // Catalog / Store loading status
+  const [catalogLoadError, setCatalogLoadError] = useState<string | null>(null);
+  const [isReloadingCatalog, setIsReloadingCatalog] = useState(false);
 
   // Notifications
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const toastTimerRef = React.useRef<number | null>(null);
 
-  // Initialize DB and load cakes on mount
+  const effectiveCakes = useMemo(
+    () => applySalesStopRulesInMemory(cakes, salesStopRules),
+    [cakes, salesStopRules, scheduleTick]
+  );
+
+  const reservableDays = useMemo(
+    () => getReservableBusinessDays(businessDays),
+    [businessDays]
+  );
+
+  useEffect(() => {
+    if (reservableDays.length > 0 && (!selectedPickupDate || !reservableDays.includes(selectedPickupDate))) {
+      setSelectedPickupDate(reservableDays[0]);
+    } else if (reservableDays.length === 0 && selectedPickupDate) {
+      setSelectedPickupDate('');
+    }
+  }, [reservableDays, selectedPickupDate]);
+
+  const loadInitialStoreData = async (forceServer: boolean = false) => {
+    setCatalogLoadError(null);
+    if (forceServer) setIsReloadingCatalog(true);
+    try {
+      const [loadedCakes, loadedDays, loadedRules] = await Promise.all([
+        fetchCakesStrict(forceServer),
+        fetchBusinessDaysStrict(forceServer),
+        fetchSalesStopRules(forceServer),
+      ]);
+      if (Array.isArray(loadedCakes) && loadedCakes.length > 0) {
+        setCakes(loadedCakes);
+      }
+      if (Array.isArray(loadedDays)) {
+        setBusinessDays(loadedDays);
+      }
+      if (Array.isArray(loadedRules)) {
+        setSalesStopRules(loadedRules);
+      }
+    } catch (err) {
+      console.error('Failed to fetch initial store data:', err);
+      setCatalogLoadError(getFriendlyFirebaseErrorMessage(err, 'load'));
+    } finally {
+      if (forceServer) setIsReloadingCatalog(false);
+    }
+  };
+
+  // Initialize DB and load cakes on mount (single read per doc, no unnecessary customer polling)
   useEffect(() => {
     let unsubscribeAuth: (() => void) | null = null;
-    let unsubscribeCakes: (() => void) | null = null;
 
     async function setup() {
-      const res = await initializeDatabase();
-      setDbAvailable(res.available);
+      await initializeDatabase();
 
-      // Subscribe to real-time cakes catalog (including sold-out states)
-      unsubscribeCakes = subscribeToCakes((updatedCakes) => {
-        if (Array.isArray(updatedCakes) && updatedCakes.length > 0) {
-          setCakes(updatedCakes);
-        }
-      });
-
-      // Fetch latest cakes and business days from cloud (also auto-migrates any local admin settings and evaluates scheduled sales stops)
-      try {
-        const [schedResult] = await Promise.all([
-          evaluateAndExecuteSalesSchedules(),
-          fetchBusinessDays()
-        ]);
-        if (Array.isArray(schedResult.cakes) && schedResult.cakes.length > 0) {
-          setCakes(schedResult.cakes);
-        }
-      } catch (err) {
-        console.error('Failed to fetch initial store data:', err);
-      }
+      await loadInitialStoreData(false);
 
       // Setup Auth observer
       unsubscribeAuth = subscribeToAuth((userData) => {
@@ -78,95 +131,144 @@ export default function App() {
     }
     setup();
 
-    const scheduleTimer = window.setInterval(() => {
-      evaluateAndExecuteSalesSchedules()
-        .then((res) => {
-          if (res.triggered && Array.isArray(res.cakes) && res.cakes.length > 0) {
-            setCakes(res.cakes);
+    // Sync across tabs in the same browser with 0 Firestore reads
+    const handleStorage = (e: StorageEvent) => {
+      if (e.key === 'cakes_catalog_list' && e.newValue) {
+        try {
+          const parsed = JSON.parse(e.newValue);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setCakes(parsed);
           }
-        })
-        .catch(() => {});
-    }, 15000);
+        } catch {}
+      } else if (e.key === 'business_days_list' && e.newValue) {
+        try {
+          const parsed = JSON.parse(e.newValue);
+          if (Array.isArray(parsed)) {
+            setBusinessDays(parsed);
+          }
+        } catch {}
+      } else if (e.key === 'sales_scheduler_rules' && e.newValue) {
+        try {
+          const parsed = JSON.parse(e.newValue);
+          if (Array.isArray(parsed)) {
+            setSalesStopRules(parsed);
+          }
+        } catch {}
+      }
+    };
+    window.addEventListener('storage', handleStorage);
+
+    // Evaluate global sales-stop scheduler rules locally in memory every 30s (0 Firestore reads)
+    const localScheduleTimer = window.setInterval(() => {
+      setScheduleTick((t) => t + 1);
+    }, 30000);
 
     return () => {
       if (unsubscribeAuth) unsubscribeAuth();
-      if (unsubscribeCakes) unsubscribeCakes();
-      window.clearInterval(scheduleTimer);
+      window.removeEventListener('storage', handleStorage);
+      window.clearInterval(localScheduleTimer);
     };
   }, []);
 
-  // Automatically remove any cake from cart if it becomes sold out while browsing catalog
+  // Automatically remove any globally sold-out cake from cart while browsing catalog
   useEffect(() => {
     if (activeTab === 'checkout') {
       // Do not silently delete cart items while customer is in ReservationForm so ReservationForm's exclusive control can display an explicit error
       return;
     }
-    setCart((prevCart) => {
-      const nextCart = { ...prevCart };
-      let removedNames: string[] = [];
-      for (const cakeId of Object.keys(nextCart)) {
-        const found = cakes.find((c) => c.id === cakeId);
-        if (!found || found.isSoldOut) {
-          if (found?.jpName) removedNames.push(found.jpName);
-          delete nextCart[cakeId];
+    const soldOutIdsToRemove: string[] = [];
+    const removedNames: string[] = [];
+    for (const cakeId of Object.keys(cart)) {
+      const found = effectiveCakes.find((c) => c.id === cakeId);
+      if (!found || found.isSoldOut) {
+        soldOutIdsToRemove.push(cakeId);
+        if (found?.jpName) removedNames.push(found.jpName);
+      }
+    }
+    if (soldOutIdsToRemove.length > 0) {
+      setCart((prevCart) => {
+        const nextCart = { ...prevCart };
+        for (const id of soldOutIdsToRemove) {
+          delete nextCart[id];
         }
-      }
-      if (removedNames.length > 0) {
-        setTimeout(() => {
-          triggerToast(`⚠️ 「${removedNames.join('・')}」は現在売り切れのためカートから除外されました`);
-        }, 0);
         return nextCart;
+      });
+      if (removedNames.length > 0) {
+        triggerToast(`⚠️ 「${removedNames.join('・')}」は現在売り切れのためカートから除外されました`);
       }
-      return prevCart;
-    });
-  }, [cakes, activeTab]);
+    }
+  }, [effectiveCakes, activeTab, cart]);
 
-  // Keep cake catalog synced when switching back to catalog tab
+  // Refresh cake catalog & business days using short TTL cache when switching back to catalog tab
   useEffect(() => {
     if (activeTab === 'catalog') {
-      fetchCakes()
-        .then((loadedCakes) => {
-          if (Array.isArray(loadedCakes)) {
+      Promise.all([
+        fetchCakesStrict(false),
+        fetchBusinessDaysStrict(false),
+        fetchSalesStopRules(false),
+      ])
+        .then(([loadedCakes, loadedDays, loadedRules]) => {
+          if (Array.isArray(loadedCakes) && loadedCakes.length > 0) {
             setCakes(loadedCakes);
+            setCatalogLoadError(null);
+          }
+          if (Array.isArray(loadedDays)) {
+            setBusinessDays(loadedDays);
+          }
+          if (Array.isArray(loadedRules)) {
+            setSalesStopRules(loadedRules);
           }
         })
-        .catch((err) => console.error('Failed to refresh cakes:', err));
+        .catch((err) => {
+          console.error('Failed to refresh cakes:', err);
+          setCatalogLoadError(getFriendlyFirebaseErrorMessage(err, 'load'));
+        });
     }
   }, [activeTab]);
 
   const triggerToast = (msg: string) => {
+    if (toastTimerRef.current) {
+      window.clearTimeout(toastTimerRef.current);
+    }
     setToastMessage(msg);
-    setTimeout(() => setToastMessage(null), 4000);
+    toastTimerRef.current = window.setTimeout(() => {
+      setToastMessage(null);
+      toastTimerRef.current = null;
+    }, 4000);
   };
 
-  const handleAddToCart = (cake: Cake, quantity: number) => {
-    if (cake.isSoldOut) {
-      triggerToast(`⚠️「${cake.jpName}」は現在売り切れ（オーダーストップ）となっております。`);
-      return;
+  const handleAddToCart = (cake: Cake, quantity: number): boolean => {
+    if (reservableDays.length === 0) {
+      triggerToast('⚠️ 現在ご予約可能なお受取り日（営業日）が設定されていないため、カートに追加できません。');
+      return false;
+    }
+    const effectiveStock = getEffectiveStockForDate(cake, selectedPickupDate);
+    if (isCakeSoldOutForDate(cake, selectedPickupDate)) {
+      triggerToast(`⚠️「${cake.jpName}」は選択中のお受取り日において売り切れ（オーダーストップ）となっております。`);
+      return false;
     }
 
     const isHall = cake.category === 'hall';
-    const isCut = cake.category === 'cut';
-    
     const currentQty = cart[cake.id] || 0;
-    
-    if (isHall) {
-      if (currentQty + quantity > 2) {
-        triggerToast(`⚠️ ホールケーキ（${cake.jpName}）は各種2台までとなっております。`);
-        return;
-      }
+    const currentTotalAll = Object.values(cart).reduce<number>((sum, qty) => sum + Number(qty || 0), 0);
+
+    if (currentTotalAll + quantity > 10) {
+      triggerToast(`⚠️ 1回のご予約で10個までです！（現在カート内: ${currentTotalAll}個）`);
+      return false;
     }
-    
-    if (isCut) {
-      const currentCutTotal = Object.entries(cart).reduce((sum, [id, qty]) => {
-        const c = cakes.find(item => item.id === id);
-        return c?.category === 'cut' ? sum + (qty as number) : sum;
-      }, 0);
-      
-      if (currentCutTotal + quantity > 10) {
-        triggerToast(`⚠️ カットケーキは全種類合わせて合計10点までとなっております。（現在カート内: ${currentCutTotal}点）`);
-        return;
-      }
+
+    if (isHall && currentQty + quantity > 2) {
+      triggerToast(`⚠️ ホールケーキ（${cake.jpName}）は各種2台までとなっております。`);
+      return false;
+    }
+
+    if (typeof effectiveStock === 'number' && currentQty + quantity > effectiveStock) {
+      triggerToast(
+        effectiveStock <= 10
+          ? `⚠️「${cake.jpName}」は残りわずかのため、これ以上追加できません。`
+          : `⚠️「${cake.jpName}」の在庫上限（${effectiveStock}個）を超えるため、これ以上追加できません。`
+      );
+      return false;
     }
 
     setCart(prev => {
@@ -174,40 +276,45 @@ export default function App() {
       return { ...prev, [cake.id]: current + quantity };
     });
     triggerToast(`🎂 ${cake.jpName}（${quantity}個）をカートに追加しました`);
+    return true;
   };
 
-  const handleUpdateCartQty = (cakeId: string, quantity: number) => {
-    const cake = cakes.find(c => c.id === cakeId);
-    if (!cake) return;
-    if (cake.isSoldOut && quantity > 0) {
-      triggerToast(`⚠️「${cake.jpName}」は現在売り切れ（オーダーストップ）となっております。`);
+  const handleUpdateCartQty = (cakeId: string, quantity: number): boolean => {
+    const cake = effectiveCakes.find(c => c.id === cakeId);
+    if (!cake) return false;
+    const effectiveStock = getEffectiveStockForDate(cake, selectedPickupDate);
+    if (isCakeSoldOutForDate(cake, selectedPickupDate) && quantity > 0) {
+      triggerToast(`⚠️「${cake.jpName}」は選択中のお受取り日において売り切れとなっております。`);
       setCart(prev => {
         const next = { ...prev };
         delete next[cakeId];
         return next;
       });
-      return;
+      return false;
     }
-    
+
     const isHall = cake.category === 'hall';
-    const isCut = cake.category === 'cut';
-    
+    const otherTotalAll = Object.entries(cart).reduce<number>((sum, [id, qty]) => {
+      return id === cakeId ? sum : sum + Number(qty || 0);
+    }, 0);
+
+    if (quantity > 0 && otherTotalAll + quantity > 10) {
+      triggerToast(`⚠️ 1回のご予約で10個までです！`);
+      return false;
+    }
+
     if (isHall && quantity > 2) {
       triggerToast(`⚠️ ホールケーキ（${cake.jpName}）は各種2台までとなっております。`);
-      return;
+      return false;
     }
-    
-    if (isCut) {
-      const otherCutTotal = Object.entries(cart).reduce((sum, [id, qty]) => {
-        if (id === cakeId) return sum;
-        const c = cakes.find(item => item.id === id);
-        return c?.category === 'cut' ? sum + (qty as number) : sum;
-      }, 0);
-      
-      if (otherCutTotal + quantity > 10) {
-        triggerToast(`⚠️ カットケーキは全種類合わせて合計10点までとなっております。`);
-        return;
-      }
+
+    if (typeof effectiveStock === 'number' && quantity > effectiveStock) {
+      triggerToast(
+        effectiveStock <= 10
+          ? `⚠️「${cake.jpName}」は残りわずかのため、これ以上追加できません。`
+          : `⚠️「${cake.jpName}」の在庫上限（${effectiveStock}個）までとなっております。`
+      );
+      return false;
     }
 
     setCart(prev => {
@@ -219,6 +326,7 @@ export default function App() {
       }
       return next;
     });
+    return true;
   };
 
   const handleClearCart = () => {
@@ -227,11 +335,11 @@ export default function App() {
 
   const totalCartQty = (Object.values(cart) as number[]).reduce((sum, qty) => sum + qty, 0);
   const totalCartPrice = Object.entries(cart).reduce((sum, [cakeId, qty]) => {
-    const cake = cakes.find(c => c.id === cakeId);
+    const cake = effectiveCakes.find(c => c.id === cakeId);
     return sum + (cake ? cake.price * (qty as number) : 0);
   }, 0);
 
-  // Client Mock Logins
+  // Admin / Google Login handler
   const handleAuthClick = async () => {
     try {
       if (user) {
@@ -251,20 +359,23 @@ export default function App() {
             uid: result.user.uid
           };
           setUser(uInfo);
-          saveMockSession(uInfo);
-          if (result.email) {
-            setMyEmailLookup(result.email);
-            triggerHistorySearch(result.email);
-          }
-          triggerToast(`こんにちは、${result.user.displayName || 'ゲスト'} 様`);
-          
           if (result.isManager) {
+            saveMockSession(uInfo);
+            triggerToast('管理者としてログインしました');
             setActiveTab('admin');
+          } else {
+            triggerToast('⚠️ このGoogleアカウントには管理者権限がありません。');
           }
         }
       }
     } catch (err) {
       console.error('Login action error:', err);
+      const raw = err instanceof Error ? err.message : '';
+      if (raw.includes('popup-closed-by-user') || raw.includes('cancelled-popup-request')) {
+        triggerToast('ログインがキャンセルされました');
+      } else {
+        triggerToast('⚠️ ログインに失敗しました。通信状況をご確認のうえ再度お試しください。');
+      }
     }
   };
 
@@ -285,12 +396,15 @@ export default function App() {
 
     setIsSearchingHistory(true);
     setSearchAttempted(true);
+    setHistoryLoadError(null);
     try {
       const data = await fetchReservations(trimmed);
       setMyReservations(data);
     } catch (err) {
       console.error('Failed to look up bookings:', err);
-      triggerToast('予約情報の取得に失敗しました');
+      const msg = getFriendlyFirebaseErrorMessage(err, 'load');
+      setHistoryLoadError(msg);
+      triggerToast(msg);
     } finally {
       setIsSearchingHistory(false);
     }
@@ -334,29 +448,6 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-sleek-bg text-sleek-text font-sans flex flex-col justify-between">
-      
-      {/* Dynamic Database Mode Indicator Tag */}
-      {dbAvailable !== null && (
-        <div className={`text-center py-1.5 sm:py-2 px-2.5 sm:px-4 text-[10px] sm:text-[11px] font-medium tracking-wide select-none flex items-center justify-center gap-1.5 transition-colors border-b leading-snug ${
-          dbAvailable 
-            ? 'bg-emerald-50/40 text-emerald-800 border-emerald-100' 
-            : 'bg-sleek-cream text-sleek-muted border-sleek-border'
-        }`}>
-          <Database className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-sleek-gold shrink-0" />
-          {dbAvailable ? (
-            <span>
-              <span className="inline-block">クラウド・データベース (Firebase Firestore) 接続完了。</span>
-              <span className="inline-block">予約は安全にクラウドに同期されます。</span>
-            </span>
-          ) : (
-            <span>
-              <span className="inline-block">（体験デモモード）Firestore接続を準備中です。</span>
-              <span className="inline-block">ご入力データは一時保存され、管理者画面をお試しいただけます。</span>
-            </span>
-          )}
-        </div>
-      )}
-
       {/* Main Luxury Brand Header Banner */}
       <header className="bg-white border-b border-sleek-border sticky top-0 z-30 shadow-xs backdrop-blur-md bg-white/95">
         <div className="max-w-7xl mx-auto px-3 sm:px-6 md:px-12 py-3 sm:py-4 md:py-5 flex items-center justify-between gap-2">
@@ -400,6 +491,8 @@ export default function App() {
 
           {/* Quick Access Actions Header Column */}
           <div className="flex items-center gap-1.5 sm:gap-3 shrink-0">
+            <PWAInstallButton className="hidden sm:inline-flex" />
+
             {/* Business Schedule quick access link */}
             <button
               id="btn-business-calendar"
@@ -491,24 +584,57 @@ export default function App() {
                     </div>
                     <div className="flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3.5 py-2 sm:py-2.5 bg-white border border-sleek-border-light rounded-xl text-sleek-dark shadow-xs justify-center whitespace-nowrap">
                       <Calendar className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-sleek-gold shrink-0" />
-                      <span className="text-[11px] sm:text-xs">締切：<strong className="text-sleek-gold font-sans font-bold">受取希望日の3日前まで</strong></span>
+                      <span className="text-[11px] sm:text-xs">締切：<strong className="text-sleek-gold font-sans font-bold">12/18（金）まで</strong></span>
                     </div>
                   </div>
                   <div className="text-xs text-center">
                     <div className="flex items-center gap-1.5 sm:gap-2 px-2 sm:px-3.5 py-2 sm:py-2.5 bg-white border border-sleek-border-light rounded-xl text-sleek-dark shadow-xs justify-center w-full whitespace-nowrap">
                       <ShoppingBag className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-sleek-gold shrink-0" />
                       <span className="text-[10px] sm:text-xs leading-tight">
-                        1回のご注文上限：<strong className="text-sleek-gold font-sans font-bold">ホール各種2台 / カット合計10個</strong>
+                        1回のご注文上限：<strong className="text-sleek-gold font-sans font-bold">合計10個まで（ホール各種2台）</strong>
                       </span>
                     </div>
                   </div>
                 </div>
 
+                <div className="sm:hidden flex justify-center pt-1">
+                  <PWAInstallButton />
+                </div>
+
                 <div className="h-0.5 w-10 sm:w-12 bg-sleek-gold mx-auto opacity-70"></div>
               </div>
 
+              {catalogLoadError && (
+                <div
+                  role="alert"
+                  className="max-w-4xl mx-auto bg-amber-50 border border-amber-300 rounded-2xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xs"
+                >
+                  <div className="flex items-start gap-2.5 text-amber-950 text-xs sm:text-sm">
+                    <AlertCircle className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+                    <p className="leading-relaxed font-medium">{catalogLoadError}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => loadInitialStoreData(true)}
+                    disabled={isReloadingCatalog}
+                    className="px-3.5 py-2 bg-amber-700 hover:bg-amber-800 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shrink-0 transition-all cursor-pointer disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isReloadingCatalog ? 'animate-spin' : ''}`} />
+                    <span>{isReloadingCatalog ? '読み込み中...' : '再読み込み'}</span>
+                  </button>
+                </div>
+              )}
+
               {/* Grid lists with categories filters */}
-              <CakeGrid cakes={cakes} onAddToCart={handleAddToCart} cart={cart} />
+              <CakeGrid
+                cakes={effectiveCakes}
+                onAddToCart={handleAddToCart}
+                onWarning={triggerToast}
+                cart={cart}
+                reservableDays={reservableDays}
+                selectedPickupDate={selectedPickupDate}
+                onSelectPickupDate={setSelectedPickupDate}
+              />
             </div>
           )}
 
@@ -522,7 +648,9 @@ export default function App() {
               </h2>
               <ReservationForm
                 cart={cart}
-                cakes={cakes}
+                cakes={effectiveCakes}
+                selectedPickupDate={selectedPickupDate}
+                onSelectPickupDate={setSelectedPickupDate}
                 onCakesUpdated={(latestCakes) => setCakes(latestCakes)}
                 onUpdateCartQty={handleUpdateCartQty}
                 onClearCart={handleClearCart}
@@ -559,7 +687,11 @@ export default function App() {
                   <p className="text-sleek-muted text-[11px] sm:text-xs leading-relaxed">
                     <span className="inline-block">ご予約時のメールアドレスまたはお電話番号を入力して、</span>
                     <br className="hidden sm:inline" />
-                    <span className="inline-block">予約内容の確認やキャンセルが可能です。</span>
+                    {isReservationDeadlinePassed() ? (
+                      <span className="inline-block">ご予約内容の確認ができます（締切後のキャンセル・変更はお電話のみで承ります）。</span>
+                    ) : (
+                      <span className="inline-block">予約内容の確認やキャンセル（12/18（金）まで）が可能です。</span>
+                    )}
                   </p>
                 </div>
 
@@ -584,9 +716,9 @@ export default function App() {
                 </form>
 
                 {/* Contact inquiry info */}
-                <div className="text-center pt-1">
+                <div className="text-center pt-1 space-y-1">
                   <p className="text-[11px] sm:text-xs text-sleek-muted font-medium leading-relaxed">
-                    <span className="inline-block">お忘れの場合は、</span>
+                    <span className="inline-block">お忘れの場合や締切後のキャンセル等は、</span>
                     <a
                       href="tel:043-239-2520"
                       className="text-sleek-gold hover:text-amber-700 underline font-semibold transition-colors inline-block"
@@ -594,7 +726,10 @@ export default function App() {
                       043-239-2520
                     </a>
                     <span className="inline-block">におかけください。</span>
-                    <span className="inline-block">（平日9:00~18:00）</span>
+                    <span className="inline-block">受付時間：平日（9：00～17：30）</span>
+                  </p>
+                  <p className="text-[10px] sm:text-[11px] text-sleek-muted/90">
+                    ※事前に確認の連絡を入れる場合がございます。
                   </p>
                 </div>
               </div>
@@ -602,7 +737,18 @@ export default function App() {
               {/* Booking List results - Compact list showing only #1 Name cards directly */}
               {searchAttempted && (
                 <div className="max-w-2xl mx-auto">
-                  {myReservations.length > 0 ? (
+                  {historyLoadError ? (
+                    <div
+                      role="alert"
+                      className="bg-red-50 p-5 sm:p-6 rounded-2xl text-center border border-red-200 text-red-800 text-xs sm:text-sm leading-relaxed max-w-md mx-auto shadow-xs space-y-3"
+                    >
+                      <div className="flex items-center justify-center gap-2 font-bold text-red-900">
+                        <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+                        <span>予約情報を読み込めませんでした</span>
+                      </div>
+                      <p>{historyLoadError}</p>
+                    </div>
+                  ) : myReservations.length > 0 ? (
                     <div className="bg-white rounded-2xl border border-stone-300 shadow-sm overflow-hidden divide-y-2 divide-stone-300">
                       {myReservations.map((res, cardIdx) => {
                         const isCancelled = res.status === 'cancelled';
@@ -673,28 +819,50 @@ export default function App() {
 
                               {/* Order cancellation trigger for pending or confirmed status */}
                               {(res.status === 'pending' || res.status === 'confirmed') && (
-                                isConfirmingCancel ? (
+                                isReservationDeadlinePassed() || Boolean(res.date && res.date <= getJstTodayStr()) ? (
+                                  <span className="text-[10px] sm:text-[11px] text-amber-900 bg-amber-50 border border-amber-200 px-2.5 py-1 rounded-lg font-semibold leading-snug">
+                                    締切後のキャンセルはお電話のみで承ります（<a href="tel:043-239-2520" className="underline font-bold">043-239-2520</a>／平日 9：00～17：30）
+                                  </span>
+                                ) : isConfirmingCancel ? (
                                   <div className="flex items-center gap-1.5">
                                     <button
                                       type="button"
+                                      disabled={isCancellingSubmit}
                                       onClick={async () => {
+                                        if (isCancellingSubmit) return;
+                                        setIsCancellingSubmit(true);
                                         try {
-                                          await updateReservationStatus(res.id, 'cancelled');
+                                          await updateReservationStatus(res.id, 'cancelled', { isCustomerRequest: true });
                                           setCancellingResId(null);
                                           triggerToast('予約をキャンセルしました（店舗スタッフへ通知を送信しました）');
+                                          fetchCakesStrict(false)
+                                            .then((fresh) => {
+                                              if (Array.isArray(fresh) && fresh.length > 0) setCakes(fresh);
+                                            })
+                                            .catch(() => {});
                                           triggerHistorySearch(myEmailLookup);
                                         } catch (err) {
                                           console.error(err);
+                                          triggerToast(
+                                            `⚠️ ${
+                                              err instanceof Error && err.message
+                                                ? err.message
+                                                : 'キャンセル処理に失敗しました。少し時間をおいて再度お試しください。'
+                                            }`
+                                          );
+                                        } finally {
+                                          setIsCancellingSubmit(false);
                                         }
                                       }}
-                                      className="text-[11px] bg-red-600 hover:bg-red-700 text-white font-bold px-2.5 py-1 rounded-lg transition-colors shadow-xs whitespace-nowrap cursor-pointer"
+                                      className="text-[11px] bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white font-bold px-2.5 py-1 rounded-lg transition-colors shadow-xs whitespace-nowrap cursor-pointer"
                                     >
-                                      キャンセルを確定する
+                                      {isCancellingSubmit ? '処理中...' : 'キャンセルを確定する'}
                                     </button>
                                     <button
                                       type="button"
+                                      disabled={isCancellingSubmit}
                                       onClick={() => setCancellingResId(null)}
-                                      className="text-[11px] bg-stone-200 hover:bg-stone-300 text-stone-700 font-medium px-2 py-1 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+                                      className="text-[11px] bg-stone-200 hover:bg-stone-300 disabled:opacity-50 text-stone-700 font-medium px-2 py-1 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
                                     >
                                       戻る
                                     </button>
@@ -815,7 +983,7 @@ export default function App() {
             <div
               key="admin-tab"
             >
-              {/* Force mock authentication gate screen if user is not a manager */}
+              {/* Require manager authentication if user is not a manager */}
               {user && user.isManager ? (
                 <AdminDashboard 
                   userEmail={user.email} 
@@ -835,49 +1003,28 @@ export default function App() {
                     <Lock className="w-7 h-7" />
                   </div>
                   <div className="space-y-2">
-                    <h2 className="text-xl font-light text-sleek-dark font-serif">店舗関係者 ログインゲート</h2>
+                    <h2 className="text-xl font-light text-sleek-dark font-serif">店舗管理者ログイン</h2>
                     <p className="text-sleek-muted text-xs leading-relaxed">
-                      こちらは「Happy Café」店舗用の管理画面です。売上指標やご予約台帳の操作ができます。
+                      こちらは「Happy Café」店舗管理者専用の管理画面です。許可された管理者アカウントでログインしてください。
                     </p>
                   </div>
 
-                  {/* Single-button mock log in bypass to let reviewers explore */}
-                  <div className="bg-sleek-cream p-5 rounded-xl text-left border border-sleek-border text-xs space-y-2.5">
-                    <p className="font-semibold text-sleek-gold tracking-wider uppercase">🔔 レビュー用バイパスのご案内</p>
-                    <p className="text-sleek-text leading-relaxed">
-                      管理者としての認証をテストするために以下のデモボタンをご利用いただけます。自動的にマネージャーメール（<strong>kanamori@happy-sweets.jp</strong>）で模擬セッションが開始されます。
-                    </p>
+                  <div className="space-y-3 pt-2">
                     <button
-                      onClick={async () => {
-                        const mockManger = {
-                          email: 'kanamori@happy-sweets.jp',
-                          isManager: true,
-                          displayName: '管理者１',
-                          uid: 'manager_uid_demo'
-                        };
-                        setUser(mockManger);
-                        saveMockSession(mockManger);
-                        triggerToast('管理者１としてログインしました');
-                      }}
-                      className="w-full mt-2 bg-sleek-dark hover:bg-black text-white font-medium py-3 px-4 rounded-xl flex items-center justify-center gap-1.5 transition-colors text-xs uppercase tracking-widest shadow-md shadow-sleek-dark/10"
+                      type="button"
+                      onClick={handleAuthClick}
+                      className="w-full bg-sleek-dark hover:bg-black text-white font-medium py-3 px-4 rounded-xl flex items-center justify-center gap-2 transition-colors text-xs uppercase tracking-widest shadow-md shadow-sleek-dark/10 cursor-pointer"
                     >
-                      関係者としてデモに入る
+                      <Lock className="w-3.5 h-3.5 text-sleek-gold" />
+                      <span>管理者Googleアカウントでログイン</span>
                     </button>
-                  </div>
 
-                  {/* Trigger Standard Auth */}
-                  <div className="flex items-center justify-between border-t border-sleek-border-light pt-4 text-xs font-semibold">
                     <button
+                      type="button"
                       onClick={() => setActiveTab('catalog')}
-                      className="text-sleek-muted hover:text-sleek-dark transition-colors uppercase tracking-wider"
+                      className="w-full py-2.5 px-4 text-sleek-muted hover:text-sleek-dark transition-colors text-xs font-semibold uppercase tracking-wider cursor-pointer"
                     >
                       ケーキ一覧に戻る
-                    </button>
-                    <button
-                      onClick={handleAuthClick}
-                      className="text-sleek-gold hover:underline transition-colors uppercase tracking-wider"
-                    >
-                      通常のサインインを試す
                     </button>
                   </div>
                 </div>
@@ -898,11 +1045,22 @@ export default function App() {
           <p className="max-w-2xl mx-auto text-[#8E8A83] text-center leading-relaxed text-[11px] sm:text-xs">
             <span className="block whitespace-nowrap">〒260-0021　千葉市中央区新宿2-6-21</span>
             <span className="block whitespace-nowrap">学校法人中村学園 ハッピー製菓調理専門学校</span>
-            <span className="block whitespace-nowrap">TEL：043-239-2520</span>
+            <span className="block">
+              TEL：<a href="tel:043-239-2520" className="text-[#C8C3BA] hover:text-sleek-gold underline underline-offset-2 transition-colors">043-239-2520</a>（受付時間：平日 9：00～17：30）
+            </span>
+            <span className="block text-[10px] sm:text-[11px] text-[#8E8A83] mt-0.5">
+              事前に確認の連絡を入れる場合がございます。
+            </span>
           </p>
           <div className="flex items-center justify-center text-[9px] sm:text-[10px] text-[#706B63] uppercase tracking-[0.15em] sm:tracking-[0.2em] border-t border-[#2D2D2D] pt-6 mt-6 gap-4 sm:gap-6 whitespace-nowrap">
             <span>&copy; 2026 HAPPY CAFÉ CRAFT PASTRY</span>
-            <span className="text-white">PRIVACY POLICY</span>
+            <button
+              type="button"
+              onClick={() => setIsPrivacyPolicyOpen(true)}
+              className="text-white/90 hover:text-sleek-gold underline underline-offset-4 transition-colors cursor-pointer"
+            >
+              PRIVACY POLICY
+            </button>
           </div>
         </div>
       </footer>
@@ -915,12 +1073,16 @@ export default function App() {
             initial={{ opacity: 0, y: 30, scale: 0.95 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 30, scale: 0.95 }}
-            className="fixed bottom-20 sm:bottom-6 right-3 sm:right-6 left-3 sm:left-auto bg-stone-900/95 backdrop-blur-md border border-stone-800 text-white px-4 py-3 sm:px-5 sm:py-4 rounded-xl shadow-2xl z-50 flex items-center justify-between gap-3 max-w-sm"
+            className={`fixed bottom-20 sm:bottom-6 right-3 sm:right-6 left-3 sm:left-auto backdrop-blur-md text-white px-4 py-3 sm:px-5 sm:py-4 rounded-xl shadow-2xl z-50 flex items-center justify-between gap-3 max-w-sm border ${
+              toastMessage.startsWith('⚠️')
+                ? 'bg-red-700/95 border-red-400'
+                : 'bg-stone-900/95 border-stone-800'
+            }`}
           >
-            <span className="text-xs font-semibold">{toastMessage}</span>
+            <span className="text-xs font-semibold leading-relaxed">{toastMessage}</span>
             <button
               onClick={() => setToastMessage(null)}
-              className="text-stone-400 hover:text-white font-bold text-xs p-1"
+              className="text-white/80 hover:text-white font-bold text-xs p-1 shrink-0"
             >
               ✕
             </button>
@@ -970,6 +1132,73 @@ export default function App() {
         isOpen={isBusinessDaysOpen}
         onClose={() => setIsBusinessDaysOpen(false)}
       />
+
+      {/* Privacy Policy Modal */}
+      {isPrivacyPolicyOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-xs"
+          onClick={() => setIsPrivacyPolicyOpen(false)}
+        >
+          <div
+            className="bg-white rounded-3xl max-w-lg w-full p-6 sm:p-8 shadow-2xl border border-sleek-border space-y-4 max-h-[85vh] overflow-y-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-sleek-border pb-3">
+              <div className="flex items-center gap-2 text-sleek-dark">
+                <FileText className="w-4 h-4 text-sleek-gold" />
+                <h3 className="font-serif text-base sm:text-lg font-medium">個人情報の取り扱いについて</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsPrivacyPolicyOpen(false)}
+                className="p-1.5 rounded-lg text-sleek-muted hover:text-sleek-dark hover:bg-stone-100 transition-colors cursor-pointer"
+                aria-label="閉じる"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs sm:text-sm text-sleek-text leading-relaxed">
+              <p>
+                学校法人中村学園 ハッピー製菓調理専門学校「Happy Café」（以下「当校」といいます）は、本予約サイトでお預かりするお客様の個人情報を以下の方針に基づき適切に管理・利用いたします。
+              </p>
+              <div className="space-y-1">
+                <p className="font-bold text-sleek-dark">1. 収集する情報</p>
+                <p className="text-sleek-muted">お名前、フリガナ、メールアドレス、お電話番号、およびご予約商品の内容・お受取り日時。</p>
+              </div>
+              <div className="space-y-1">
+                <p className="font-bold text-sleek-dark">2. 利用目的</p>
+                <p className="text-sleek-muted">ケーキのご予約受付・内容確認、店舗でのお渡し時のご本人確認、予約変更・キャンセル等に関するご連絡のためにのみ利用いたします。</p>
+              </div>
+              <div className="space-y-1">
+                <p className="font-bold text-sleek-dark">3. 第三者への提供</p>
+                <p className="text-sleek-muted">法令に基づく場合を除き、お客様の同意なく第三者に個人情報を提供することはありません。</p>
+              </div>
+              <div className="space-y-1">
+                <p className="font-bold text-sleek-dark">4. お問い合わせ窓口</p>
+                <p className="text-sleek-muted">
+                  〒260-0021 千葉市中央区新宿2-6-21<br />
+                  学校法人中村学園 ハッピー製菓調理専門学校 Happy Café<br />
+                  TEL：043-239-2520（受付時間：平日 9：00～17：30）<br />
+                  ※事前に確認の連絡を入れる場合がございます。
+                </p>
+              </div>
+            </div>
+
+            <div className="pt-2">
+              <button
+                type="button"
+                onClick={() => setIsPrivacyPolicyOpen(false)}
+                className="w-full py-2.5 bg-sleek-dark hover:bg-black text-white rounded-xl text-xs font-bold tracking-wider transition-colors cursor-pointer"
+              >
+                閉じる
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <OfflineIndicator />
     </div>
   );
 }

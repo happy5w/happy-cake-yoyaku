@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { Reservation, CancellationNotification } from '../types';
 import { 
   fetchReservations, 
@@ -7,8 +7,8 @@ import {
   markCancellationNotificationRead, 
   markAllCancellationNotificationsRead, 
   subscribeToReservations,
-  fetchBusinessDays,
-  subscribeToBusinessDays
+  fetchBusinessDaysStrict,
+  getFriendlyFirebaseErrorMessage
 } from '../lib/dbService';
 import { motion } from 'motion/react';
 import { 
@@ -47,6 +47,7 @@ export default function StaffPickupMode({ onExit, onToast }: StaffPickupModeProp
   const [businessDays, setBusinessDays] = useState<string[]>([]);
   const [cancelNotifications, setCancelNotifications] = useState<CancellationNotification[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [selectedDate, setSelectedDate] = useState<string>('all');
   const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'completed' | 'cancelled'>('all');
   
@@ -56,42 +57,62 @@ export default function StaffPickupMode({ onExit, onToast }: StaffPickupModeProp
   const [revertingId, setRevertingId] = useState<string | null>(null);
   const [revertTimer, setRevertTimer] = useState<number | null>(null);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const hasInitializedDateRef = useRef(false);
 
   const loadReservations = async () => {
     setLoading(true);
+    setLoadError(null);
     try {
       const data = await fetchReservations();
       setReservations(data);
       const notifs = await fetchCancellationNotifications(data);
       setCancelNotifications(notifs);
-      const bDays = await fetchBusinessDays();
+      const bDays = await fetchBusinessDaysStrict(true);
       setBusinessDays(bDays);
     } catch (err) {
       console.error('Failed to load reservations in staff mode:', err);
+      setLoadError(getFriendlyFirebaseErrorMessage(err, 'load'));
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    loadReservations();
+    let active = true;
+    setLoading(true);
+    setLoadError(null);
 
-    const unsubscribe = subscribeToReservations((updatedReservations, updatedNotifs, newlyCancelled) => {
-      setReservations(updatedReservations);
-      setCancelNotifications(updatedNotifs);
-      if (newlyCancelled.length > 0 && onToast) {
-        const names = newlyCancelled.map(r => `${r.name} 様（${r.date}）`).join('、');
-        onToast(`🚨 予約キャンセル通知：${names} の予約がキャンセルされました`);
+    fetchBusinessDaysStrict(false)
+      .then((bDays) => {
+        if (active) setBusinessDays(bDays);
+      })
+      .catch((err) => {
+        console.warn('Failed loading business days in staff mode:', err);
+        if (active) setLoadError(getFriendlyFirebaseErrorMessage(err, 'load'));
+      });
+
+    const unsubscribe = subscribeToReservations(
+      (updatedReservations, updatedNotifs, newlyCancelled) => {
+        if (!active) return;
+        setReservations(updatedReservations);
+        setCancelNotifications(updatedNotifs);
+        setLoadError(null);
+        setLoading(false);
+        if (newlyCancelled.length > 0 && onToast) {
+          const names = newlyCancelled.map(r => `${r.name} 様（${r.date}）`).join('、');
+          onToast(`🚨 予約キャンセル通知：${names} の予約がキャンセルされました`);
+        }
+      },
+      (err) => {
+        if (!active) return;
+        setLoadError(getFriendlyFirebaseErrorMessage(err, 'load'));
+        setLoading(false);
       }
-    });
-
-    const unsubscribeBDays = subscribeToBusinessDays((updatedBDays) => {
-      setBusinessDays(updatedBDays);
-    });
+    );
 
     return () => {
+      active = false;
       unsubscribe();
-      unsubscribeBDays();
     };
   }, []);
 
@@ -118,16 +139,17 @@ export default function StaffPickupMode({ onExit, onToast }: StaffPickupModeProp
     return Array.from(set).sort();
   }, [businessDays, reservations]);
 
-  // If today is an available date, default to today when first loaded; otherwise default to first available date or all
+  // Auto-select today (or first available date) once on initial load, preserving manual selection afterward
   useEffect(() => {
-    if (availableDates.length > 0 && selectedDate === 'all') {
+    if (!hasInitializedDateRef.current && availableDates.length > 0 && selectedDate === 'all') {
+      hasInitializedDateRef.current = true;
       if (availableDates.includes(todayStr)) {
         setSelectedDate(todayStr);
       } else {
         setSelectedDate(availableDates[0]);
       }
     }
-  }, [availableDates, todayStr]);
+  }, [availableDates, todayStr, selectedDate]);
 
   // Clean up auto-reset timer for 2-tap confirmation
   useEffect(() => {
@@ -324,6 +346,22 @@ export default function StaffPickupMode({ onExit, onToast }: StaffPickupModeProp
           </button>
         </div>
       </div>
+
+      {loadError && (
+        <div className="bg-amber-50 border border-amber-300 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-amber-950 shadow-xs">
+          <div className="flex items-start gap-2.5 text-xs sm:text-sm font-bold">
+            <AlertCircle className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+            <span>{loadError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={loadReservations}
+            className="px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-xl transition-colors whitespace-nowrap self-end sm:self-center cursor-pointer"
+          >
+            再読み込み
+          </button>
+        </div>
+      )}
 
       {/* Staff Cancellation Notification Alert Banner */}
       {unreadCancelNotifications.length > 0 && (

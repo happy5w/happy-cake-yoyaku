@@ -44,8 +44,9 @@ export function buildReservationRows(reservations: Reservation[], cakes?: Cake[]
       .join('、');
 
     const cakeQtys = (cakes || []).map(c => {
-      const found = safeItems.find(i => i.cakeId === c.id || i.cakeName === c.jpName);
-      return found ? found.quantity : 0;
+      return safeItems
+        .filter(i => i.cakeId === c.id || i.cakeName === c.jpName)
+        .reduce((sum, i) => sum + (Number(i.quantity) || 0), 0);
     });
 
     const totalQty = safeItems.reduce((sum, i) => sum + (Number(i.quantity) || 0), 0);
