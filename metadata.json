@@ -1,0 +1,6 @@
+{
+  "name": "Happy Café Cake Reservation",
+  "description": "Happy Café特製ケーキ予約センター。美しいケーキセレクション、引き取り日時指定に加え、売上動向分析やリアルタイム在庫管理ができるダッシュボードも兼ね備えた予約システム。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

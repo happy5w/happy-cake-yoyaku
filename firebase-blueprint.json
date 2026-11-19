@@ -1,0 +1,54 @@
+{
+  "entities": {
+    "ReservationItem": {
+      "title": "ReservationItem",
+      "description": "Selected cake item details and quantity inside a reservation",
+      "type": "object",
+      "properties": {
+        "cakeId": { "type": "string", "description": "The unique ID of the cake" },
+        "cakeName": { "type": "string", "description": "The Japanese localized name of the cake" },
+        "quantity": { "type": "integer", "description": "The amount ordered" },
+        "price": { "type": "integer", "description": "The unit price of the cake at order time" }
+      },
+      "required": ["cakeId", "cakeName", "quantity", "price"]
+    },
+    "Reservation": {
+      "title": "Reservation",
+      "description": "Information about a custom cake reservation booking",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Auto-generated UUID or Firestore Document ID" },
+        "name": { "type": "string", "description": "The contact person's full name" },
+        "email": { "type": "string", "description": "The contact person's email address" },
+        "phone": { "type": "string", "description": "The contact person's phone number" },
+        "date": { "type": "string", "format": "date", "description": "The requested collection date (YYYY-MM-DD)" },
+        "time": { "type": "string", "description": "The collection time slot (HH:MM)" },
+        "items": {
+          "type": "array",
+          "description": "List of booked cakes"
+        },
+        "totalPrice": { "type": "integer", "description": "Total checkout price in JPY" },
+        "notes": { "type": "string", "description": "Special preparation instructions or requirements" },
+        "candleCount": { "type": "integer", "description": "Number of free candles requested" },
+        "messageCard": { "type": "string", "description": "Custom text for the decorative chocolate message plate" },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "confirmed", "cancelled", "completed"],
+          "description": "Current authorization status of the order"
+        },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Timestamp when reservation was originally placed" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Timestamp when state last altered" }
+      },
+      "required": ["name", "email", "phone", "date", "time", "items", "totalPrice", "status", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/reservations/{reservationId}": {
+      "schema": "Reservation",
+      "description": "Collection storing all active and historic user cake reservations"
+    },
+    "/settings/{settingId}": {
+      "description": "App operational settings such as business_days and cakes_catalog"
+    }
+  }
+}

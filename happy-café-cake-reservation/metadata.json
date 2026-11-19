@@ -1,0 +1,6 @@
+{
+  "name": "Happy Café Cake Reservation",
+  "description": "Happy Café（ハッピー製菓調理専門学校）のクリスマスケーキWEB予約サイト。お好みのケーキとお受取り日時を選んで簡単にご予約いただけます。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
